@@ -60,6 +60,7 @@
 #define TASKID_SPAWNDELAY 786
 #define TASKID_WEAPONSMENU 564
 #define TASKID_CHECKSPAWN 423
+#define TASKID_ZRESPAWN 912
 
 #define EQUIP_PRI (1<<0)
 #define EQUIP_SEC (1<<1)
@@ -237,9 +238,10 @@ new cvar_enabled, cvar_randomspawn, cvar_autonvg, cvar_winsounds, cvar_weaponsme
     cvar_knockback_duck, cvar_killreward, cvar_painshockfree, cvar_zombie_class,
     cvar_shootobjects, cvar_ammo, Float:cvar_starttime, Float:cvar_knockback_dist,
     Float:cvar_zombiemulti, Float:cvar_zombie_hpmulti, Float:cvar_pushpwr_weapon,
-    Float:cvar_pushpwr_zombie, cvar_c4mission, Float:cvar_c4_planttime, Float:cvar_c4_radius
+    Float:cvar_pushpwr_zombie, cvar_c4mission, Float:cvar_c4_planttime, Float:cvar_c4_radius,
+    cvar_zombie_respawn, Float:cvar_zombie_respawn_time
 
-new bool:g_zombie[33], bool:g_disconnected[33], bool:g_showmenu[33], bool:g_menufailsafe[33],
+new bool:g_zrespawn[33], bool:g_zombie[33], bool:g_disconnected[33], bool:g_showmenu[33], bool:g_menufailsafe[33],
     bool:g_preinfect[33], bool:g_welcomemsg[33], bool:g_suicide[33], Float:g_regendelay[33],
     g_mutate[33], g_victim[33], g_menuposition[33], g_player_class[33], g_player_weapons[33][2]
 
@@ -293,6 +295,8 @@ public plugin_precache()
 	bind_float("bh_pushpwr_weapon", "2.0", cvar_pushpwr_weapon)
 	bind_float("bh_pushpwr_zombie", "5.0", cvar_pushpwr_zombie)
 	bind_int("bh_c4mission", "1", cvar_c4mission)
+	bind_int("bh_zombie_respawn", "1", cvar_zombie_respawn)
+	bind_float("bh_zombie_respawn_time", "3.0", cvar_zombie_respawn_time)
 	bind_float("bh_c4_planttime", "3.0", cvar_c4_planttime)
 	bind_float("bh_c4_radius", "120.0", cvar_c4_radius)
 
@@ -396,6 +400,7 @@ public plugin_init()
 	RegisterHookChain(RG_CBasePlayer_TakeDamage, "rg_player_takedamage_post", true)
 	RegisterHookChain(RG_CBasePlayer_TraceAttack, "rg_player_traceattack")
 	RegisterHookChain(RG_CBasePlayer_Killed, "rg_player_killed")
+	RegisterHookChain(RG_CBasePlayer_Killed, "rg_player_killed_post", true)
 	RegisterHookChain(RG_CGrenade_DefuseBombEnd, "rg_defuse_end_post", true)
 	RegisterHookChain(RG_HandleMenu_ChooseTeam, "rg_choose_team")
 	RegisterHookChain(RG_PlayerBlind, "rg_player_blind")
@@ -537,6 +542,7 @@ public client_connect(id)
 	g_player_weapons[id][0] = -1
 	g_player_weapons[id][1] = -1
 	g_regendelay[id] = 0.0
+	g_zrespawn[id] = false
 }
 
 public client_putinserver(id)
@@ -551,7 +557,9 @@ public client_disconnected(id)
 	remove_task(TASKID_SPAWNDELAY + id)
 	remove_task(TASKID_WEAPONSMENU + id)
 	remove_task(TASKID_CHECKSPAWN + id)
+	remove_task(TASKID_ZRESPAWN + id)
 
+	g_zrespawn[id] = false
 	g_disconnected[id] = true
 }
 
@@ -722,6 +730,12 @@ public rg_round_restart_post()
 	g_zombies_exist = false
 	DisableHookChain(g_hc_impulse)
 	c4_reset()
+
+	for(new id = 1; id <= g_maxplayers; id++)
+	{
+		remove_task(TASKID_ZRESPAWN + id)
+		g_zrespawn[id] = false
+	}
 
 	if(cvar_buytime)
 	{
@@ -1215,6 +1229,62 @@ public rg_player_killed(const victim, killer, shouldgib)
 	return HC_CONTINUE
 }
 
+// Zombie respawn: queued when a zombie dies, cancelled once one survivor is left
+public rg_player_killed_post(const victim, killer, shouldgib)
+{
+	if(!cvar_zombie_respawn || !g_zombie[victim] || !g_gamestarted || g_roundended)
+		return HC_CONTINUE
+
+	if(count_survivors() <= 1)
+	{
+		client_print(victim, print_center, "Last survivor left, no respawn!")
+		return HC_CONTINUE
+	}
+
+	remove_task(TASKID_ZRESPAWN + victim)
+	set_task(cvar_zombie_respawn_time, "task_zombie_respawn", TASKID_ZRESPAWN + victim)
+
+	client_print(victim, print_center, "Respawning in %.0f seconds...", cvar_zombie_respawn_time)
+	return HC_CONTINUE
+}
+
+public task_zombie_respawn(taskid)
+{
+	static id, team
+	id = taskid - TASKID_ZRESPAWN
+
+	if(!cvar_zombie_respawn || !g_gamestarted || g_roundended || !is_user_connected(id) || is_user_alive(id) || !g_zombie[id])
+		return
+
+	team = get_member(id, m_iTeam)
+	if(!is_playing_team(team))
+		return
+
+	// The rule is checked again at respawn time, the survivor count may have changed
+	if(count_survivors() <= 1)
+	{
+		client_print(id, print_center, "Last survivor left, no respawn!")
+		return
+	}
+
+	g_zrespawn[id] = true
+	rg_round_respawn(id)
+}
+
+// Alive humans
+stock count_survivors()
+{
+	static id, count
+	count = 0
+
+	for(id = 1; id <= g_maxplayers; id++)
+	{
+		if(!g_zombie[id] && is_user_alive(id))
+			count++
+	}
+	return count
+}
+
 reward_clip(id)
 {
 	static weapon, maxclip
@@ -1244,8 +1314,9 @@ public rg_player_spawn_post(const id)
 
 	if(g_zombie[id])
 	{
-		if(cvar_respawnaszombie && !g_roundended)
+		if((cvar_respawnaszombie || g_zrespawn[id]) && !g_roundended)
 		{
+			g_zrespawn[id] = false
 			set_zombie_attibutes(id)
 			return HC_CONTINUE
 		}
@@ -1503,6 +1574,10 @@ public task_checkspawn(taskid)
 	id = taskid - TASKID_CHECKSPAWN
 
 	if(g_roundended || !is_user_connected(id) || is_user_alive(id))
+		return
+
+	// Zombies are handled by the zombie respawn rules (no respawn for the last survivor)
+	if(g_zombie[id])
 		return
 
 	team = get_member(id, m_iTeam)
