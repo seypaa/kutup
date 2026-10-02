@@ -22,6 +22,8 @@
 *   - Flashlight block (FM_CmdStart) -> RG_CBasePlayer_ImpulseCommands
 *   - Random spawns task -> RG_CSGameRules_GetPlayerSpawnSpot
 *   - Ham_CS_RoundRespawn -> rg_round_respawn
+*   - Persistent stats: XP / level / infections / zombie kills saved per SteamID in nvault,
+*     /rank and /top commands (needs the nvault module enabled)
 *   - C4 mission: zombies plant a bomb at a random spawn point (rg_plant_bomb),
 *     survivors defuse it with the stock CS defuse; bomb result ends the round
 *   - ScreenFade message filter (flashbang) -> RG_PlayerBlind
@@ -42,6 +44,7 @@
 #include <fakemeta>
 #include <hamsandwich>
 #include <reapi>
+#include <nvault>
 #include <xs>
 
 #tryinclude "biohazard.cfg"
@@ -239,10 +242,12 @@ new cvar_enabled, cvar_randomspawn, cvar_autonvg, cvar_winsounds, cvar_weaponsme
     cvar_shootobjects, cvar_ammo, Float:cvar_starttime, Float:cvar_knockback_dist,
     Float:cvar_zombiemulti, Float:cvar_zombie_hpmulti, Float:cvar_pushpwr_weapon,
     Float:cvar_pushpwr_zombie, cvar_c4mission, Float:cvar_c4_planttime, Float:cvar_c4_radius,
-    cvar_zombie_respawn, Float:cvar_zombie_respawn_time, cvar_mutation_max,
+    cvar_zombie_respawn, Float:cvar_zombie_respawn_time, cvar_mutation_max, cvar_stats,
+    cvar_xp_infect, cvar_xp_kill, cvar_xp_bomb, cvar_maxlevel,
     Float:cvar_mutation_health, Float:cvar_mutation_speed, Float:cvar_mutation_attack
 
-new g_mutation[33], bool:g_zrespawn[33], bool:g_zombie[33], bool:g_disconnected[33], bool:g_showmenu[33], bool:g_menufailsafe[33],
+new g_vault, g_xp[33], g_level[33], g_stat_infects[33], g_stat_kills[33], g_stat_key[33][40],
+    bool:g_stats_loaded[33], g_mutation[33], bool:g_zrespawn[33], bool:g_zombie[33], bool:g_disconnected[33], bool:g_showmenu[33], bool:g_menufailsafe[33],
     bool:g_preinfect[33], bool:g_welcomemsg[33], bool:g_suicide[33], Float:g_regendelay[33],
     g_mutate[33], g_victim[33], g_menuposition[33], g_player_class[33], g_player_weapons[33][2]
 
@@ -297,6 +302,11 @@ public plugin_precache()
 	bind_float("bh_pushpwr_zombie", "5.0", cvar_pushpwr_zombie)
 	bind_int("bh_c4mission", "1", cvar_c4mission)
 	bind_int("bh_zombie_respawn", "1", cvar_zombie_respawn)
+	bind_int("bh_stats", "1", cvar_stats)
+	bind_int("bh_xp_infect", "5", cvar_xp_infect)
+	bind_int("bh_xp_kill", "10", cvar_xp_kill)
+	bind_int("bh_xp_bomb", "25", cvar_xp_bomb)
+	bind_int("bh_maxlevel", "50", cvar_maxlevel)
 	bind_int("bh_mutation_max", "3", cvar_mutation_max)
 	bind_float("bh_mutation_health", "50.0", cvar_mutation_health)
 	bind_float("bh_mutation_speed", "15.0", cvar_mutation_speed)
@@ -387,6 +397,8 @@ public plugin_init()
 	register_clcmd("say /class", "cmd_classmenu")
 	register_clcmd("say /guns", "cmd_enablemenu")
 	register_clcmd("say /help", "cmd_helpmotd")
+	register_clcmd("say /rank", "cmd_rank")
+	register_clcmd("say /top", "cmd_top")
 	register_clcmd("amx_infect", "cmd_infectuser", ADMIN_BAN, "<name or #userid>")
 
 	register_menu("Equipment", 1023, "action_equip")
@@ -473,6 +485,10 @@ public plugin_init()
 
 	g_maxplayers = get_maxplayers()
 
+	g_vault = nvault_open("biohazard_stats")
+	if(g_vault == INVALID_HANDLE)
+		log_amx("Could not open the nvault, stats will not be saved")
+
 	cache_weapon_ids()
 
 	if(g_skyname[0])
@@ -496,8 +512,15 @@ public plugin_init()
 
 public plugin_end()
 {
-	if(cvar_enabled)
-		set_pcvar_num(g_cvar_autoteambalance, g_autoteambalance)
+	if(!cvar_enabled)
+		return
+
+	set_pcvar_num(g_cvar_autoteambalance, g_autoteambalance)
+
+	stats_save_all()
+
+	if(g_vault != INVALID_HANDLE)
+		nvault_close(g_vault)
 }
 
 public plugin_natives()
@@ -559,6 +582,9 @@ public client_putinserver(id)
 
 public client_disconnected(id)
 {
+	stats_save(id)
+	stats_clear(id)
+
 	remove_task(TASKID_UPDATESCR + id)
 	remove_task(TASKID_SPAWNDELAY + id)
 	remove_task(TASKID_WEAPONSMENU + id)
@@ -803,6 +829,8 @@ public rg_round_end_post(WinStatus:status, ScenarioEventEndRound:event, Float:de
 	remove_task(TASKID_STARTROUND)
 
 	set_task(0.1, "task_balanceteam", TASKID_BALANCETEAM)
+
+	stats_save_all()
 }
 
 public event_textmsg()
@@ -1194,6 +1222,9 @@ public rg_player_takedamage_post(const victim, inflictor, attacker, Float:damage
 	infect_user(victim, attacker)
 	mutate_zombie(attacker)
 
+	g_stat_infects[attacker]++
+	award_xp(attacker, cvar_xp_infect)
+
 	static Float:frags
 	pev(attacker, pev_frags, frags)
 
@@ -1242,7 +1273,17 @@ public rg_player_killed_post(const victim, killer, shouldgib)
 {
 	// A zombie that kills a survivor mutates, a zombie that dies loses its mutations
 	if(!g_zombie[victim] && is_valid_player(killer) && g_zombie[killer])
+	{
 		mutate_zombie(killer)
+
+		g_stat_infects[killer]++
+		award_xp(killer, cvar_xp_infect)
+	}
+	else if(g_zombie[victim] && is_valid_player(killer) && !g_zombie[killer] && killer != victim)
+	{
+		g_stat_kills[killer]++
+		award_xp(killer, cvar_xp_kill)
+	}
 
 	if(g_zombie[victim] && g_mutation[victim])
 		mutation_reset(victim)
@@ -1298,6 +1339,166 @@ stock count_survivors()
 			count++
 	}
 	return count
+}
+
+/* ------------------------------------------------------------------ */
+/* Persistent stats (nvault)                                           */
+/* ------------------------------------------------------------------ */
+
+// XP needed to reach a level: 100 * level^2
+stock xp_for_level(level)
+	return 100 * level * level
+
+stock level_from_xp(xp)
+	return min(floatround(floatsqroot(float(xp) / 100.0), floatround_floor), max(cvar_maxlevel, 0))
+
+stats_clear(id)
+{
+	g_xp[id] = 0
+	g_level[id] = 0
+	g_stat_infects[id] = 0
+	g_stat_kills[id] = 0
+	g_stats_loaded[id] = false
+	g_stat_key[id][0] = 0
+}
+
+public client_authorized(id, const authid[])
+{
+	if(!cvar_enabled || !cvar_stats || g_vault == INVALID_HANDLE || is_user_bot(id) || is_user_hltv(id))
+		return
+
+	stats_clear(id)
+
+	// LAN / pending ids are not unique, use the name for them
+	if(equal(authid, "STEAM_ID_LAN") || equal(authid, "VALVE_ID_LAN") || equal(authid, "STEAM_ID_PENDING") || equal(authid, "HLTV") || !authid[0])
+	{
+		static name[32]
+		get_user_name(id, name, charsmax(name))
+		formatex(g_stat_key[id], charsmax(g_stat_key[]), "N:%s", name)
+	}
+	else
+		copy(g_stat_key[id], charsmax(g_stat_key[]), authid)
+
+	static data[64], timestamp, a[12], b[12], c[12]
+
+	if(nvault_lookup(g_vault, g_stat_key[id], data, charsmax(data), timestamp))
+	{
+		parse(data, a, charsmax(a), b, charsmax(b), c, charsmax(c))
+
+		g_xp[id] = str_to_num(a)
+		g_stat_infects[id] = str_to_num(b)
+		g_stat_kills[id] = str_to_num(c)
+	}
+
+	g_level[id] = level_from_xp(g_xp[id])
+	g_stats_loaded[id] = true
+}
+
+stats_save(id)
+{
+	if(!g_stats_loaded[id] || g_vault == INVALID_HANDLE)
+		return
+
+	static data[64]
+	formatex(data, charsmax(data), "%d %d %d", g_xp[id], g_stat_infects[id], g_stat_kills[id])
+
+	nvault_set(g_vault, g_stat_key[id], data)
+}
+
+stats_save_all()
+{
+	for(new id = 1; id <= g_maxplayers; id++)
+	{
+		if(g_stats_loaded[id])
+			stats_save(id)
+	}
+}
+
+award_xp(id, amount)
+{
+	if(!cvar_stats || amount <= 0 || !is_valid_player(id) || !g_stats_loaded[id])
+		return
+
+	static newlevel
+	g_xp[id] += amount
+	newlevel = level_from_xp(g_xp[id])
+
+	if(newlevel <= g_level[id])
+		return
+
+	g_level[id] = newlevel
+
+	static name[32]
+	get_user_name(id, name, charsmax(name))
+
+	set_hudmessage(255, 215, 0, -1.0, 0.35, 0, 0.0, 4.0, 0.1, 0.5)
+	ShowSyncHudMsg(id, g_sync_msgdisplay, "LEVEL UP!^nYou reached level %d", newlevel)
+	client_print(0, print_chat, "[Biohazard] %s reached level %d!", name, newlevel)
+}
+
+public cmd_rank(id)
+{
+	if(!cvar_stats || !g_stats_loaded[id])
+	{
+		client_print(id, print_chat, "[Biohazard] Your stats are not available yet.")
+		return PLUGIN_HANDLED
+	}
+
+	static pos, total, other
+	pos = 1
+	total = 0
+
+	for(other = 1; other <= g_maxplayers; other++)
+	{
+		if(!g_stats_loaded[other])
+			continue
+
+		total++
+
+		if(g_xp[other] > g_xp[id])
+			pos++
+	}
+
+	if(g_level[id] >= cvar_maxlevel)
+		client_print(id, print_chat, "[Biohazard] Level %d (MAX), %d XP", g_level[id], g_xp[id])
+	else
+		client_print(id, print_chat, "[Biohazard] Level %d, %d/%d XP to level %d", g_level[id], g_xp[id], xp_for_level(g_level[id] + 1), g_level[id] + 1)
+
+	client_print(id, print_chat, "[Biohazard] Infections: %d, Zombie kills: %d, Rank: %d/%d online", g_stat_infects[id], g_stat_kills[id], pos, total)
+	return PLUGIN_HANDLED
+}
+
+// Top players currently on the server
+public cmd_top(id)
+{
+	static order[32], count, other, i, j, tmp, name[32]
+	count = 0
+
+	for(other = 1; other <= g_maxplayers; other++)
+	{
+		if(g_stats_loaded[other])
+			order[count++] = other
+	}
+
+	// Insertion sort by XP, highest first
+	for(i = 1; i < count; i++)
+	{
+		tmp = order[i]
+
+		for(j = i - 1; j >= 0 && g_xp[order[j]] < g_xp[tmp]; j--)
+			order[j + 1] = order[j]
+
+		order[j + 1] = tmp
+	}
+
+	client_print(id, print_chat, "[Biohazard] Top players online:")
+
+	for(i = 0; i < count && i < 5; i++)
+	{
+		get_user_name(order[i], name, charsmax(name))
+		client_print(id, print_chat, "%d. %s - Level %d (%d XP)", i + 1, name, g_level[order[i]], g_xp[order[i]])
+	}
+	return PLUGIN_HANDLED
 }
 
 /* ------------------------------------------------------------------ */
@@ -1610,6 +1811,9 @@ public task_spawned(taskid)
 		replace(message, charsmax(message), "#Version#", VERSION)
 
 		client_print(id, print_chat, message)
+
+		if(g_stats_loaded[id])
+			client_print(id, print_chat, "[Biohazard] Level %d, %d XP. Type /rank for your stats, /top for the best players.", g_level[id], g_xp[id])
 	}
 
 	if(g_suicide[id])
@@ -1951,6 +2155,7 @@ c4_plant(planter)
 	set_hudmessage(255, 60, 60, -1.0, 0.25, 1, 0.0, 6.0, 0.2, 0.2)
 	ShowSyncHudMsg(0, g_sync_c4, "%s planted the C4!^nSurvivors: defuse it before it explodes!", name)
 	client_print(0, print_chat, "[Biohazard] %s planted the C4! Survivors must defuse it.", name)
+	award_xp(planter, cvar_xp_bomb)
 }
 
 public rg_defuse_end_post(const bomb, const player, bool:bDefused)
@@ -1962,6 +2167,7 @@ public rg_defuse_end_post(const bomb, const player, bool:bDefused)
 	get_user_name(player, name, charsmax(name))
 
 	client_print(0, print_chat, "[Biohazard] %s defused the C4! Survivors win.", name)
+	award_xp(player, cvar_xp_bomb)
 	return HC_CONTINUE
 }
 
