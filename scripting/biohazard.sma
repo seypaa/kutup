@@ -18,10 +18,19 @@
 *   - Zombie knife view model (stripngive task, CurWeapon event) -> pre hook on
 *     DefaultDeploy, and AddPlayerItem is blocked so zombies cannot pick up guns
 *   - Pain shock free velocity restore (PreThink pre/post) -> m_flVelocityModifier
-*   - Fall damage "watertype" trick -> DMG_FALL blocked in TakeDamage
+*   - Fall damage "watertype" trick -> RG_CSGameRules_FlPlayerFallDamage
 *   - Flashlight block (FM_CmdStart) -> RG_CBasePlayer_ImpulseCommands
 *   - Random spawns task -> RG_CSGameRules_GetPlayerSpawnSpot
 *   - Ham_CS_RoundRespawn -> rg_round_respawn
+*   - ScreenFade message filter (flashbang) -> RG_PlayerBlind
+*   - DeathMsg message filter -> RG_CSGameRules_SendDeathMessage
+*   - "jointeam" client command -> RG_HandleMenu_ChooseTeam
+*   - Fall damage -> RG_CSGameRules_FlPlayerFallDamage
+*   - FM_EmitSound -> RH_SV_StartSound (falls back to FM_EmitSound without ReHLDS)
+*   - Per-frame PreThink / PostThink / ImpulseCommands hooks are gone or are only
+*     enabled while needed (Enable/DisableHookChain); zombie regeneration is one timer
+*   - Clip / armor / maxspeed pdata access -> rg_set_user_ammo, rg_get_user_armor,
+*     rg_reset_maxspeed; helper entities -> rg_create_entity
 */
 
 #define VERSION	"2.00 Beta 3 ReAPI"
@@ -207,7 +216,8 @@ new const g_dataname[][] =
 
 new g_maxplayers, g_spawncount, g_buyzone, g_sync_hpdisplay, g_sync_msgdisplay, g_fwd_spawn,
     g_fwd_result, g_fwd_infect, g_fwd_gamestart, g_msg_flashlight, g_msg_scoreattrib,
-    g_msg_deathmsg, g_msg_screenfade, g_msg_scoreinfo, Float:g_buytime,
+    g_msg_deathmsg, g_msg_screenfade, g_msg_scoreinfo, Float:g_buytime, bool:g_zombies_exist,
+    HookChain:g_hc_impulse, HookChain:g_hc_postthink,
     Float:g_spawns[MAX_SPAWNS+1][9], bool:g_infecting, bool:g_gamestarted, bool:g_roundstarted,
     bool:g_roundended, bool:g_allow_item, bool:g_setting_model, g_class_name[MAX_CLASSES+1][32],
     g_classcount, g_class_desc[MAX_CLASSES+1][32], g_class_pmodel[MAX_CLASSES+1][64],
@@ -324,14 +334,14 @@ public plugin_precache()
 
 	g_fwd_spawn = register_forward(FM_Spawn, "fwd_spawn")
 
-	g_buyzone = engfunc(EngFunc_CreateNamedEntity, engfunc(EngFunc_AllocString, "func_buyzone"))
+	g_buyzone = rg_create_entity("func_buyzone")
 	if(g_buyzone)
 	{
 		dllfunc(DLLFunc_Spawn, g_buyzone)
 		set_pev(g_buyzone, pev_solid, SOLID_NOT)
 	}
 
-	new ent = engfunc(EngFunc_CreateNamedEntity, engfunc(EngFunc_AllocString, "info_bomb_target"))
+	new ent = rg_create_entity("info_bomb_target")
 	if(ent)
 	{
 		dllfunc(DLLFunc_Spawn, ent)
@@ -339,7 +349,7 @@ public plugin_precache()
 	}
 
 	#if FOG_ENABLE
-	ent = engfunc(EngFunc_CreateNamedEntity, engfunc(EngFunc_AllocString, "env_fog"))
+	ent = rg_create_entity("env_fog")
 	if(ent)
 	{
 		fm_set_kvd(ent, "density", FOG_DENSITY, "env_fog")
@@ -357,7 +367,6 @@ public plugin_init()
 	g_autoteambalance = get_pcvar_num(g_cvar_autoteambalance)
 	set_pcvar_num(g_cvar_autoteambalance, 0)
 
-	register_clcmd("jointeam", "cmd_jointeam")
 	register_clcmd("say /class", "cmd_classmenu")
 	register_clcmd("say /guns", "cmd_enablemenu")
 	register_clcmd("say /help", "cmd_helpmotd")
@@ -369,7 +378,6 @@ public plugin_init()
 	register_menu("Class", 1023, "action_class")
 
 	unregister_forward(FM_Spawn, g_fwd_spawn)
-	register_forward(FM_EmitSound, "fwd_emitsound")
 	register_forward(FM_GetGameDescription, "fwd_gamedescription")
 	register_forward(FM_CreateNamedEntity, "fwd_createnamedentity")
 	register_forward(FM_ClientKill, "fwd_clientkill")
@@ -380,9 +388,22 @@ public plugin_init()
 	RegisterHookChain(RG_CBasePlayer_TakeDamage, "rg_player_takedamage_post", true)
 	RegisterHookChain(RG_CBasePlayer_TraceAttack, "rg_player_traceattack")
 	RegisterHookChain(RG_CBasePlayer_Killed, "rg_player_killed")
-	RegisterHookChain(RG_CBasePlayer_PreThink, "rg_player_prethink")
-	RegisterHookChain(RG_CBasePlayer_PostThink, "rg_player_postthink", true)
-	RegisterHookChain(RG_CBasePlayer_ImpulseCommands, "rg_player_impulse")
+	RegisterHookChain(RG_HandleMenu_ChooseTeam, "rg_choose_team")
+	RegisterHookChain(RG_PlayerBlind, "rg_player_blind")
+	RegisterHookChain(RG_CSGameRules_FlPlayerFallDamage, "rg_fall_damage")
+	RegisterHookChain(RG_CSGameRules_SendDeathMessage, "rg_send_deathmessage")
+
+	// Needed only part of the time, switched with Enable/DisableHookChain
+	g_hc_postthink = RegisterHookChain(RG_CBasePlayer_PostThink, "rg_player_postthink", true)
+	g_hc_impulse = RegisterHookChain(RG_CBasePlayer_ImpulseCommands, "rg_player_impulse")
+	DisableHookChain(g_hc_postthink)
+	DisableHookChain(g_hc_impulse)
+
+	// Sounds: ReHLDS hook rewrites the sample in place, FM fallback re-emits
+	if(is_rehlds())
+		RegisterHookChain(RH_SV_StartSound, "rh_sv_startsound")
+	else
+		register_forward(FM_EmitSound, "fwd_emitsound")
 	RegisterHookChain(RG_CBasePlayer_AddPlayerItem, "rg_player_additem")
 	RegisterHookChain(RG_CBasePlayer_GiveDefaultItems, "rg_player_givedefaultitems")
 	RegisterHookChain(RG_CBasePlayer_ResetMaxSpeed, "rg_player_resetmaxspeed", true)
@@ -416,8 +437,6 @@ public plugin_init()
 	register_message(get_user_msgid("SendAudio"), "msg_sendaudio")
 	register_message(get_user_msgid("StatusIcon"), "msg_statusicon")
 	register_message(g_msg_scoreattrib, "msg_scoreattrib")
-	register_message(g_msg_deathmsg, "msg_deathmsg")
-	register_message(g_msg_screenfade, "msg_screenfade")
 	register_message(get_user_msgid("TeamInfo"), "msg_teaminfo")
 	register_message(get_user_msgid("WeapPickup"), "msg_weaponpickup")
 	register_message(get_user_msgid("AmmoPickup"), "msg_ammopickup")
@@ -447,6 +466,8 @@ public plugin_init()
 		set_cvar_num("sv_skycolor_g", 0)
 		set_cvar_num("sv_skycolor_b", 0)
 	}
+
+	set_task(0.05, "task_regen", _, _, _, "b")
 
 	if(cvar_showtruehealth)
 		set_task(0.2, "task_showtruehealth", _, _, _, "b")
@@ -521,16 +542,6 @@ public client_disconnected(id)
 	remove_task(TASKID_CHECKSPAWN + id)
 
 	g_disconnected[id] = true
-}
-
-public cmd_jointeam(id)
-{
-	if(g_zombie[id] && is_user_alive(id))
-	{
-		client_print(id, print_center, "%L", id, "CMD_TEAMCHANGE")
-		return PLUGIN_HANDLED
-	}
-	return PLUGIN_CONTINUE
 }
 
 public cmd_classmenu(id)
@@ -620,19 +631,6 @@ public msg_teaminfo(msgid, dest, id)
 	return PLUGIN_CONTINUE
 }
 
-public msg_screenfade(msgid, dest, id)
-{
-	if(!cvar_flashbang)
-		return PLUGIN_CONTINUE
-
-	if((!g_zombie[id] || !is_user_alive(id))
-	&& get_msg_arg_int(4) == 255 && get_msg_arg_int(5) == 255
-	&& get_msg_arg_int(6) == 255 && get_msg_arg_int(7) > 199)
-		return PLUGIN_HANDLED
-
-	return PLUGIN_CONTINUE
-}
-
 public msg_scoreattrib(msgid, dest, id)
 {
 	if(get_msg_arg_int(2) == ATTRIB_BOMB)
@@ -652,15 +650,6 @@ public msg_weaponpickup(msgid, dest, id)
 
 public msg_ammopickup(msgid, dest, id)
 	return g_zombie[id] ? PLUGIN_HANDLED : PLUGIN_CONTINUE
-
-public msg_deathmsg(msgid, dest, id)
-{
-	static killer
-	killer = get_msg_arg_int(1)
-
-	if(is_valid_player(killer) && g_zombie[killer] && is_user_connected(killer))
-		set_msg_arg_string(4, g_zombie_weapname)
-}
 
 public msg_sendaudio(msgid, dest, id)
 {
@@ -719,8 +708,14 @@ public rg_round_restart_post()
 {
 	g_gamestarted = false
 
+	g_zombies_exist = false
+	DisableHookChain(g_hc_impulse)
+
 	if(cvar_buytime)
+	{
 		g_buytime = cvar_buytime + get_gametime()
+		EnableHookChain(g_hc_postthink)
+	}
 
 	remove_task(TASKID_NEWROUND)
 	remove_task(TASKID_INITROUND)
@@ -876,7 +871,7 @@ public event_curweapon(id)
 			maxclip = g_weapon_ammo[weapon][MAX_CLIP]
 
 			if(maxclip > 0 && read_data(3) < 1)
-				fill_active_clip(id, maxclip)
+				rg_set_user_ammo(id, WeaponIdType:weapon, maxclip)
 		}
 	}
 	return PLUGIN_CONTINUE
@@ -884,46 +879,94 @@ public event_curweapon(id)
 
 public event_armortype(id)
 {
-	if(g_zombie[id] && is_user_alive(id) && get_member(id, m_iKevlar) != ARMOR_NONE)
+	if(g_zombie[id] && is_user_alive(id) && rg_get_user_armor(id) > 0)
 		rg_set_user_armor(id, 0, ARMOR_NONE)
 
 	return PLUGIN_CONTINUE
 }
 
-public rg_player_prethink(const id)
+// Zombie health regeneration, one timer instead of a hook on every player frame
+public task_regen()
 {
-	// Zombie health regeneration; humans leave on the first flag test
-	if(!g_zombie[id] || !g_gamestarted)
-		return HC_CONTINUE
+	if(!g_gamestarted || !g_zombies_exist)
+		return
 
-	static pclass, Float:health
-	pclass = g_player_class[id]
-	pev(id, pev_health, health)
+	static id, pclass, Float:health, Float:now, Float:interval
+	now = get_gametime()
 
-	if(health < g_class_data[pclass][DATA_HEALTH] && is_user_alive(id))
+	for(id = 1; id <= g_maxplayers; id++)
 	{
-		static Float:gametime
-		gametime = get_gametime()
+		if(!g_zombie[id] || g_regendelay[id] > now || !is_user_alive(id))
+			continue
 
-		if(g_regendelay[id] < gametime)
-		{
-			set_pev(id, pev_health, health + 1.0)
-			g_regendelay[id] = gametime + g_class_data[pclass][DATA_REGENDLY]
-		}
+		pclass = g_player_class[id]
+		pev(id, pev_health, health)
+
+		if(health >= g_class_data[pclass][DATA_HEALTH])
+			continue
+
+		set_pev(id, pev_health, health + 1.0)
+
+		// Carry the remainder so the real rate matches DATA_REGENDLY
+		interval = g_class_data[pclass][DATA_REGENDLY]
+		g_regendelay[id] = (now - g_regendelay[id] > interval) ? now + interval : g_regendelay[id] + interval
 	}
-	return HC_CONTINUE
 }
 
-// Keeps the buy zone "touched" while the buy time is running
+// Keeps the buy zone "touched" while the buy time is running (hook is only enabled then)
 public rg_player_postthink(const id)
 {
-	if(cvar_buytime && g_buytime > get_gametime() && is_user_alive(id) && pev_valid(g_buyzone))
+	if(g_buytime <= get_gametime())
+	{
+		DisableHookChain(g_hc_postthink)
+		return HC_CONTINUE
+	}
+
+	if(is_user_alive(id) && pev_valid(g_buyzone))
 		dllfunc(DLLFunc_Touch, g_buyzone, id)
 
 	return HC_CONTINUE
 }
 
-// Flashlight is disabled for zombies
+// Zombies cannot change team
+public rg_choose_team(const id, MenuChooseTeam:slot)
+{
+	if(!g_zombie[id] || !is_user_alive(id))
+		return HC_CONTINUE
+
+	client_print(id, print_center, "%L", id, "CMD_TEAMCHANGE")
+	return HC_SUPERCEDE
+}
+
+// Flashbangs only blind zombies (survivors and spectators are immune)
+public rg_player_blind(const index, const inflictor, const attacker, const Float:fadeTime, const Float:fadeHold, const alpha, Float:color[3])
+{
+	if(cvar_flashbang && alpha > 199 && (!g_zombie[index] || !is_user_alive(index)))
+		return HC_SUPERCEDE
+
+	return HC_CONTINUE
+}
+
+// Zombies do not take fall damage
+public rg_fall_damage(const id)
+{
+	if(!g_zombie[id])
+		return HC_CONTINUE
+
+	SetHookChainReturn(ATYPE_FLOAT, 0.0)
+	return HC_SUPERCEDE
+}
+
+// Kill feed shows the claw icon when a zombie kills somebody
+public rg_send_deathmessage(const pKiller, const pVictim, const pAssister, const pevInflictor, const killerWeaponName[], const DeathMessageFlags:iDeathMessageFlags, const KillRarity:iRarityOfKill)
+{
+	if(is_valid_player(pKiller) && g_zombie[pKiller])
+		SetHookChainArg(5, ATYPE_STRING, g_zombie_weapname)
+
+	return HC_CONTINUE
+}
+
+// Flashlight is disabled for zombies (hook is only enabled while zombies exist)
 public rg_player_impulse(const id)
 {
 	if(g_zombie[id] && pev(id, pev_impulse) == 100 && is_user_alive(id))
@@ -1024,13 +1067,6 @@ public rg_player_traceattack(const victim, attacker, Float:damage, Float:directi
 
 public rg_player_takedamage(const victim, inflictor, attacker, Float:damage, damagetype)
 {
-	// Zombies are immune to fall damage
-	if((damagetype & DMG_FALL) && g_zombie[victim])
-	{
-		SetHookChainReturn(ATYPE_INTEGER, 0)
-		return HC_SUPERCEDE
-	}
-
 	if(damagetype & DMG_GENERIC || victim == attacker || !is_valid_player(attacker) || !is_user_alive(victim) || !is_user_connected(attacker))
 		return HC_CONTINUE
 
@@ -1169,27 +1205,18 @@ public rg_player_killed(const victim, killer, shouldgib)
 
 reward_clip(id)
 {
-	static maxclip
-	maxclip = g_weapon_ammo[get_user_weapon(id)][MAX_CLIP]
+	static weapon, maxclip
+	weapon = get_user_weapon(id)
+	maxclip = g_weapon_ammo[weapon][MAX_CLIP]
 
 	if(maxclip > 0)
-		fill_active_clip(id, maxclip)
+		rg_set_user_ammo(id, WeaponIdType:weapon, maxclip)
 }
 
 reward_grenade(id)
 {
 	if(!rg_has_item_by_name(id, "weapon_hegrenade"))
 		rg_give_item(id, "weapon_hegrenade")
-}
-
-// The active item is the weapon that fired, no entity search needed
-fill_active_clip(id, amount)
-{
-	static ent
-	ent = get_member(id, m_pActiveItem)
-
-	if(ent > 0 && pev_valid(ent))
-		set_member(ent, m_Weapon_iClip, amount)
 }
 
 public rg_player_spawn_post(const id)
@@ -1223,35 +1250,74 @@ public rg_player_spawn_post(const id)
 /* Engine forwards                                                     */
 /* ------------------------------------------------------------------ */
 
-public fwd_emitsound(id, channel, sample[], Float:volume, Float:attn, flag, pitch)
+#define SOUND_IGNORE 0
+#define SOUND_BLOCK 1
+#define SOUND_REPLACE 2
+
+// Shared sound logic: night vision sounds are muted, zombies use their own claw and death sounds
+stock sound_filter(id, channel, const sample[], out[], len)
 {
-	if(channel == CHAN_ITEM && sample[6] == 'n' && sample[7] == 'v' && sample[8] == 'g')
-		return FMRES_SUPERCEDE
+	if(channel == CHAN_ITEM && equal(sample, "items/nvg", 9))
+		return SOUND_BLOCK
 
 	if(!is_valid_player(id) || !g_zombie[id] || !is_user_connected(id))
-		return FMRES_IGNORED
+		return SOUND_IGNORE
 
-	if(sample[8] == 'k' && sample[9] == 'n' && sample[10] == 'i')
+	static s[32]
+	copy(s, charsmax(s), sample)
+
+	if(s[8] == 'k' && s[9] == 'n' && s[10] == 'i')
 	{
-		if(sample[14] == 's' && sample[15] == 'l' && sample[16] == 'a')
+		if(s[14] == 's' && s[15] == 'l' && s[16] == 'a')
 		{
-			emit_sound(id, channel, g_zombie_miss_sounds[_random(sizeof g_zombie_miss_sounds)], volume, attn, flag, pitch)
-			return FMRES_SUPERCEDE
+			copy(out, len, g_zombie_miss_sounds[_random(sizeof g_zombie_miss_sounds)])
+			return SOUND_REPLACE
 		}
-		else if(sample[14] == 'h' && sample[15] == 'i' && sample[16] == 't' || sample[14] == 's' && sample[15] == 't' && sample[16] == 'a')
-		{
-			if(sample[17] == 'w' && sample[18] == 'a' && sample[19] == 'l')
-				emit_sound(id, channel, g_zombie_miss_sounds[_random(sizeof g_zombie_miss_sounds)], volume, attn, flag, pitch)
-			else
-				emit_sound(id, channel, g_zombie_hit_sounds[_random(sizeof g_zombie_hit_sounds)], volume, attn, flag, pitch)
 
-			return FMRES_SUPERCEDE
+		if(s[14] == 'h' && s[15] == 'i' && s[16] == 't' || s[14] == 's' && s[15] == 't' && s[16] == 'a')
+		{
+			if(s[17] == 'w' && s[18] == 'a' && s[19] == 'l')
+				copy(out, len, g_zombie_miss_sounds[_random(sizeof g_zombie_miss_sounds)])
+			else
+				copy(out, len, g_zombie_hit_sounds[_random(sizeof g_zombie_hit_sounds)])
+
+			return SOUND_REPLACE
 		}
 	}
-	else if(sample[7] == 'd' && (sample[8] == 'i' && sample[9] == 'e' || sample[12] == '6'))
+	else if(s[7] == 'd' && (s[8] == 'i' && s[9] == 'e' || s[12] == '6'))
 	{
-		emit_sound(id, channel, g_zombie_die_sounds[_random(sizeof g_zombie_die_sounds)], volume, attn, flag, pitch)
-		return FMRES_SUPERCEDE
+		copy(out, len, g_zombie_die_sounds[_random(sizeof g_zombie_die_sounds)])
+		return SOUND_REPLACE
+	}
+	return SOUND_IGNORE
+}
+
+// ReHLDS: the sample is swapped before the engine sends it, nothing is re-emitted
+public rh_sv_startsound(const recipients, const entity, const channel, const sample[], const volume, Float:attenuation, const fFlags, const pitch)
+{
+	static out[64]
+
+	switch(sound_filter(entity, channel, sample, out, charsmax(out)))
+	{
+		case SOUND_BLOCK: return HC_SUPERCEDE
+		case SOUND_REPLACE: SetHookChainArg(4, ATYPE_STRING, out)
+	}
+	return HC_CONTINUE
+}
+
+// Fallback for servers without ReHLDS
+public fwd_emitsound(id, channel, sample[], Float:volume, Float:attn, flag, pitch)
+{
+	static out[64]
+
+	switch(sound_filter(id, channel, sample, out, charsmax(out)))
+	{
+		case SOUND_BLOCK: return FMRES_SUPERCEDE
+		case SOUND_REPLACE:
+		{
+			emit_sound(id, channel, out, volume, attn, flag, pitch)
+			return FMRES_SUPERCEDE
+		}
 	}
 	return FMRES_IGNORED
 }
@@ -1699,6 +1765,12 @@ set_zombie_attibutes(const index)
 
 	g_zombie[index] = true
 
+	if(!g_zombies_exist)
+	{
+		g_zombies_exist = true
+		EnableHookChain(g_hc_impulse)
+	}
+
 	new iClass = g_player_class[index]
 	new Float:flHealth = g_class_data[iClass][DATA_HEALTH]
 
@@ -1709,9 +1781,9 @@ set_zombie_attibutes(const index)
 
 	set_pev(index, pev_health, flHealth)
 	set_pev(index, pev_gravity, g_class_data[iClass][DATA_GRAVITY])
-	set_pev(index, pev_maxspeed, g_class_data[iClass][DATA_SPEED])
 	set_pev(index, pev_body, 0)
 
+	rg_reset_maxspeed(index)
 	rg_set_user_armor(index, 0, ARMOR_NONE)
 	set_member(index, m_bHasNightVision, true)
 
