@@ -70,14 +70,17 @@
 #define TASKID_ZRESPAWN 912
 #define TASKID_HUDCHECK 950
 #define TASKID_COUNTDOWN 951
+#define TASKID_WELCOME 970
 
 // HUD status sprites, lowest number = highest priority
-#define HUD_COUNTDOWN 0
-#define HUD_LASTSURV 1
-#define HUD_NORESPAWN 2
-#define HUD_MUTATION 3
-#define HUD_STATUS_COUNT 4
+#define HUD_WELCOME 0
+#define HUD_COUNTDOWN 1
+#define HUD_LASTSURV 2
+#define HUD_NORESPAWN 3
+#define HUD_MUTATION 4
+#define HUD_STATUS_COUNT 5
 #define HUD_OFFSET_Y 80
+#define HUD_WELCOME_OFFSET_Y -90
 
 #define EQUIP_PRI (1<<0)
 #define EQUIP_SEC (1<<1)
@@ -257,11 +260,11 @@ new cvar_enabled, cvar_randomspawn, cvar_autonvg, cvar_winsounds, cvar_weaponsme
     Float:cvar_zombiemulti, Float:cvar_zombie_hpmulti, Float:cvar_pushpwr_weapon,
     Float:cvar_pushpwr_zombie, cvar_c4mission, Float:cvar_c4_planttime, Float:cvar_c4_radius,
     cvar_zombie_respawn, Float:cvar_zombie_respawn_time, cvar_mutation_max, cvar_stats,
-    cvar_xp_infect, cvar_xp_kill, cvar_xp_bomb, cvar_maxlevel, cvar_class_motd, cvar_hud,
+    cvar_xp_infect, cvar_xp_kill, cvar_xp_bomb, cvar_maxlevel, cvar_class_motd, cvar_hud, Float:cvar_hud_welcome,
     Float:cvar_mutation_health, Float:cvar_mutation_speed, Float:cvar_mutation_attack
 
 new HudSprite:g_hs_countdown[11], HudSprite:g_hs_mutation[6], HudSprite:g_hs_last,
-    HudSprite:g_hs_norespawn, HudSprite:g_hud_status[33][HUD_STATUS_COUNT], HudSprite:g_hud_shown[33],
+    HudSprite:g_hs_norespawn, HudSprite:g_hs_welcome, HudSprite:g_hud_status[33][HUD_STATUS_COUNT], HudSprite:g_hud_shown[33],
     g_hud_rot[33], bool:g_hud_off[33], Float:g_infect_time, g_cd_last,
     g_class_motd_count, g_class_motd_path[96], g_vault, g_xp[33], g_level[33], g_stat_infects[33], g_stat_kills[33], g_stat_key[33][40],
     bool:g_stats_loaded[33], g_mutation[33], bool:g_zrespawn[33], bool:g_zombie[33], bool:g_disconnected[33], bool:g_showmenu[33], bool:g_menufailsafe[33],
@@ -322,6 +325,7 @@ public plugin_precache()
 	bind_int("bh_stats", "1", cvar_stats)
 	bind_int("bh_class_motd", "1", cvar_class_motd)
 	bind_int("bh_hud", "1", cvar_hud)
+	bind_float("bh_hud_welcome", "6.0", cvar_hud_welcome)
 	bind_int("bh_xp_infect", "5", cvar_xp_infect)
 	bind_int("bh_xp_kill", "10", cvar_xp_kill)
 	bind_int("bh_xp_bomb", "25", cvar_xp_bomb)
@@ -622,6 +626,7 @@ public client_disconnected(id)
 	remove_task(TASKID_WEAPONSMENU + id)
 	remove_task(TASKID_CHECKSPAWN + id)
 	remove_task(TASKID_ZRESPAWN + id)
+	remove_task(TASKID_WELCOME + id)
 
 	g_zrespawn[id] = false
 	g_disconnected[id] = true
@@ -1630,7 +1635,7 @@ public cmd_top(id)
  * so nothing binary has to be copied to the server (and FTP text mode cannot corrupt it). */
 
 #define ICON_SIZE 48
-#define ICON_PIXELS (ICON_SIZE * ICON_SIZE)
+#define ICON_BUFFER (144 * 48)
 
 // Palette indexes, 255 is the transparent one
 #define PAL_WHITE 1
@@ -1655,15 +1660,45 @@ new const g_icon_font[10][7] =
 	{ 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C }
 }
 
-new g_icon[ICON_PIXELS]
+// 5x7 letters for the welcome banner (+ row 0 for the dot of the Turkish I, row 8 for the cedilla)
+// ids: 0 A, 1 C, 2 D, 3 E, 4 G, 5 H, 6 I, 7 L, 8 M, 9 N, 10 O, 11 S, 12 U, 13 Z, 14 S-cedilla, 15 dotted I
+new const g_letters[16][9] =
+{
+	{ 0x00, 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11, 0x00 },
+	{ 0x00, 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E, 0x00 },
+	{ 0x00, 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E, 0x00 },
+	{ 0x00, 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F, 0x00 },
+	{ 0x00, 0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F, 0x00 },
+	{ 0x00, 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11, 0x00 },
+	{ 0x00, 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E, 0x00 },
+	{ 0x00, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F, 0x00 },
+	{ 0x00, 0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11, 0x00 },
+	{ 0x00, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11, 0x00 },
+	{ 0x00, 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00 },
+	{ 0x00, 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E, 0x00 },
+	{ 0x00, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00 },
+	{ 0x00, 0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F, 0x00 },
+	{ 0x00, 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E, 0x04 },
+	{ 0x04, 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E, 0x00 }
+}
 
-cv_clear()
-	arrayset(g_icon, PAL_NONE, ICON_PIXELS)
+// SUNUCUMUZA / HOSGELDINIZ
+new const g_welcome_line1[] = { 11, 12, 9, 12, 1, 12, 8, 12, 13, 0 }
+new const g_welcome_line2[] = { 5, 10, 14, 4, 3, 7, 2, 15, 9, 15, 13 }
+
+new g_icon[ICON_BUFFER], g_icon_w, g_icon_h
+
+cv_clear(width, height)
+{
+	g_icon_w = width
+	g_icon_h = height
+	arrayset(g_icon, PAL_NONE, width * height)
+}
 
 cv_set(x, y, color)
 {
-	if(x >= 0 && x < ICON_SIZE && y >= 0 && y < ICON_SIZE)
-		g_icon[y * ICON_SIZE + x] = color
+	if(x >= 0 && x < g_icon_w && y >= 0 && y < g_icon_h)
+		g_icon[y * g_icon_w + x] = color
 }
 
 cv_rect(x0, y0, x1, y1, color)
@@ -1704,9 +1739,9 @@ bool:cv_inside(const Float:pts[][2], count, Float:x, Float:y)
 
 cv_polygon(const Float:pts[][2], count, color)
 {
-	for(new y = 0; y < ICON_SIZE; y++)
+	for(new y = 0; y < g_icon_h; y++)
 	{
-		for(new x = 0; x < ICON_SIZE; x++)
+		for(new x = 0; x < g_icon_w; x++)
 		{
 			if(cv_inside(pts, count, float(x) + 0.5, float(y) + 0.5))
 				cv_set(x, y, color)
@@ -1750,8 +1785,8 @@ cv_number(number, scale, color)
 
 	digits[count++] = number % 10
 
-	x = (ICON_SIZE - (count * 5 * scale + (count - 1) * scale)) / 2
-	y = (ICON_SIZE - 7 * scale) / 2
+	x = (g_icon_w - (count * 5 * scale + (count - 1) * scale)) / 2
+	y = (g_icon_h - 7 * scale) / 2
 
 	for(i = 0; i < count; i++)
 	{
@@ -1760,6 +1795,25 @@ cv_number(number, scale, color)
 			for(col = 0; col < 5; col++)
 			{
 				if(g_icon_font[digits[i]][row] & (1 << (4 - col)))
+					cv_rect(x + col * scale, y + row * scale, x + col * scale + scale - 1, y + row * scale + scale - 1, color)
+			}
+		}
+		x += 6 * scale
+	}
+}
+
+// One line of letters (glyph ids) at the given top-left, scale pixels per font pixel
+cv_letters(const ids[], count, x, y, scale, color)
+{
+	new i, row, col
+
+	for(i = 0; i < count; i++)
+	{
+		for(row = 0; row < 9; row++)
+		{
+			for(col = 0; col < 5; col++)
+			{
+				if(g_letters[ids[i]][row] & (1 << (4 - col)))
 					cv_rect(x + col * scale, y + row * scale, x + col * scale + scale - 1, y + row * scale + scale - 1, color)
 			}
 		}
@@ -1798,9 +1852,9 @@ hud_write_sprite(const name[])
 	fwrite(file, 2, BLOCK_INT)                  // version
 	fwrite(file, 2, BLOCK_INT)                  // type: vp_parallel
 	fwrite(file, 3, BLOCK_INT)                  // texture format: alpha test
-	fwrite(file, _:33.936, BLOCK_INT)           // bounding radius
-	fwrite(file, ICON_SIZE, BLOCK_INT)          // width
-	fwrite(file, ICON_SIZE, BLOCK_INT)          // height
+	fwrite(file, _:(floatsqroot(float(g_icon_w * g_icon_w + g_icon_h * g_icon_h)) / 2.0), BLOCK_INT) // bounding radius
+	fwrite(file, g_icon_w, BLOCK_INT)           // width
+	fwrite(file, g_icon_h, BLOCK_INT)           // height
 	fwrite(file, 1, BLOCK_INT)                  // frames
 	fwrite(file, 0, BLOCK_INT)                  // beam length
 	fwrite(file, 0, BLOCK_INT)                  // sync type
@@ -1808,11 +1862,11 @@ hud_write_sprite(const name[])
 	fwrite_blocks(file, palette, 768, BLOCK_BYTE)
 
 	fwrite(file, 0, BLOCK_INT)                  // frame group
-	fwrite(file, -ICON_SIZE / 2, BLOCK_INT)     // origin x
-	fwrite(file, ICON_SIZE / 2, BLOCK_INT)      // origin y
-	fwrite(file, ICON_SIZE, BLOCK_INT)
-	fwrite(file, ICON_SIZE, BLOCK_INT)
-	fwrite_blocks(file, g_icon, ICON_PIXELS, BLOCK_BYTE)
+	fwrite(file, -g_icon_w / 2, BLOCK_INT)      // origin x
+	fwrite(file, g_icon_h / 2, BLOCK_INT)       // origin y
+	fwrite(file, g_icon_w, BLOCK_INT)
+	fwrite(file, g_icon_h, BLOCK_INT)
+	fwrite_blocks(file, g_icon, g_icon_w * g_icon_h, BLOCK_BYTE)
 
 	fclose(file)
 }
@@ -1823,7 +1877,7 @@ hud_generate_sprites()
 
 	for(i = 1; i <= 10; i++)
 	{
-		cv_clear()
+		cv_clear(ICON_SIZE, ICON_SIZE)
 		cv_number(i, (i < 10) ? 4 : 3, (i > 3) ? PAL_YELLOW : PAL_RED)
 
 		formatex(name, charsmax(name), "bh_cd_%d", i)
@@ -1832,7 +1886,7 @@ hud_generate_sprites()
 
 	for(i = 1; i <= 5; i++)
 	{
-		cv_clear()
+		cv_clear(ICON_SIZE, ICON_SIZE)
 
 		switch(i)
 		{
@@ -1856,7 +1910,7 @@ hud_generate_sprites()
 	}
 
 	// Last survivor: warning triangle with an exclamation mark
-	cv_clear()
+	cv_clear(ICON_SIZE, ICON_SIZE)
 	cv_triangle(24, 4, 45, 42, 3, 42, PAL_YELLOW)
 	cv_triangle(24, 12, 38, 37, 10, 37, PAL_NONE)
 	cv_rect(22, 18, 25, 30, PAL_YELLOW)
@@ -1864,7 +1918,7 @@ hud_generate_sprites()
 	hud_write_sprite("bh_last")
 
 	// No more respawns: skull
-	cv_clear()
+	cv_clear(ICON_SIZE, ICON_SIZE)
 	cv_circle(24, 20, 14, PAL_WHITE)
 	cv_rect(15, 28, 33, 40, PAL_WHITE)
 	cv_circle(18, 20, 4, PAL_NONE)
@@ -1875,6 +1929,12 @@ hud_generate_sprites()
 		cv_rect(18 + i * 4, 34, 19 + i * 4, 40, PAL_NONE)
 
 	hud_write_sprite("bh_norespawn")
+
+	// Welcome banner, two lines of 2x scaled letters (130 and 118 pixels wide)
+	cv_clear(144, 40)
+	cv_letters(g_welcome_line1, sizeof g_welcome_line1, 12, 1, 2, PAL_YELLOW)
+	cv_letters(g_welcome_line2, sizeof g_welcome_line2, 6, 21, 2, PAL_WHITE)
+	hud_write_sprite("bh_welcome")
 }
 
 // Must run in plugin_precache; missing sprite files just give InvalidHudSprite
@@ -1898,6 +1958,7 @@ hud_precache()
 
 	g_hs_last = HS_PrecacheSprite("bh_last", 0, HUD_OFFSET_Y)
 	g_hs_norespawn = HS_PrecacheSprite("bh_norespawn", 0, HUD_OFFSET_Y)
+	g_hs_welcome = HS_PrecacheSprite("bh_welcome", 0, HUD_WELCOME_OFFSET_Y)
 }
 
 hud_reset_player(id)
@@ -1949,7 +2010,8 @@ hud_refresh(id)
 		return
 	}
 
-	target = list[g_hud_rot[id] % count]
+	// The welcome banner is shown alone, the other icons rotate
+	target = (g_hud_status[id][HUD_WELCOME] != InvalidHudSprite) ? g_hud_status[id][HUD_WELCOME] : list[g_hud_rot[id] % count]
 
 	if(target != g_hud_shown[id])
 	{
@@ -1979,13 +2041,28 @@ public task_hud_rotate()
 				active++
 		}
 
-		if(active > 1)
+		if(active > 1 && g_hud_status[id][HUD_WELCOME] == InvalidHudSprite)
 		{
 			g_hud_rot[id]++
 			hud_refresh(id)
 		}
 	}
 }
+
+// Welcome banner shown for a few seconds when a player first spawns
+hud_welcome(id)
+{
+	if(cvar_hud_welcome <= 0.0 || !cvar_hud)
+		return
+
+	hud_set(id, HUD_WELCOME, g_hs_welcome)
+
+	remove_task(TASKID_WELCOME + id)
+	set_task(cvar_hud_welcome, "task_welcome_end", TASKID_WELCOME + id)
+}
+
+public task_welcome_end(taskid)
+	hud_clear(taskid - TASKID_WELCOME, HUD_WELCOME)
 
 public cmd_hud(id)
 {
@@ -2396,6 +2473,8 @@ public task_spawned(taskid)
 		replace(message, charsmax(message), "#Version#", VERSION)
 
 		client_print(id, print_chat, message)
+
+		hud_welcome(id)
 
 		if(cvar_class_motd && g_classcount > 1)
 			cmd_classmenu(id)
