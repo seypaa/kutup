@@ -22,6 +22,13 @@
 *   - Flashlight block (FM_CmdStart) -> RG_CBasePlayer_ImpulseCommands
 *   - Random spawns task -> RG_CSGameRules_GetPlayerSpawnSpot
 *   - Ham_CS_RoundRespawn -> rg_round_respawn
+*   - Persistent stats: XP / level / infections / zombie kills saved per SteamID in nvault,
+*     /rank and /top commands (needs the nvault module enabled)
+*   - HUD status icons (sprites_on_hud.sma must be loaded BEFORE this plugin): infection
+*     countdown, last survivor / no-respawn warnings and the mutation level. Only one
+*     sprite can be shown per player, so a small manager picks by priority and rotates
+*   - C4 mission: zombies plant a bomb at a random spawn point (rg_plant_bomb),
+*     survivors defuse it with the stock CS defuse; bomb result ends the round
 *   - ScreenFade message filter (flashbang) -> RG_PlayerBlind
 *   - DeathMsg message filter -> RG_CSGameRules_SendDeathMessage
 *   - "jointeam" client command -> RG_HandleMenu_ChooseTeam
@@ -40,6 +47,8 @@
 #include <fakemeta>
 #include <hamsandwich>
 #include <reapi>
+#include <nvault>
+#include <sprites_on_hud>
 #include <xs>
 
 #tryinclude "biohazard.cfg"
@@ -58,6 +67,17 @@
 #define TASKID_SPAWNDELAY 786
 #define TASKID_WEAPONSMENU 564
 #define TASKID_CHECKSPAWN 423
+#define TASKID_ZRESPAWN 912
+#define TASKID_HUDCHECK 950
+#define TASKID_COUNTDOWN 951
+
+// HUD status sprites, lowest number = highest priority
+#define HUD_COUNTDOWN 0
+#define HUD_LASTSURV 1
+#define HUD_NORESPAWN 2
+#define HUD_MUTATION 3
+#define HUD_STATUS_COUNT 4
+#define HUD_OFFSET_Y 80
 
 #define EQUIP_PRI (1<<0)
 #define EQUIP_SEC (1<<1)
@@ -217,7 +237,8 @@ new const g_dataname[][] =
 new g_maxplayers, g_spawncount, g_buyzone, g_sync_hpdisplay, g_sync_msgdisplay, g_fwd_spawn,
     g_fwd_result, g_fwd_infect, g_fwd_gamestart, g_msg_flashlight, g_msg_scoreattrib,
     g_msg_deathmsg, g_msg_screenfade, g_msg_scoreinfo, Float:g_buytime, bool:g_zombies_exist,
-    HookChain:g_hc_impulse, HookChain:g_hc_postthink,
+    HookChain:g_hc_impulse, HookChain:g_hc_postthink, bool:g_c4_active, Float:g_c4_site[3],
+    Float:g_c4_progress[33], g_spr_ring, g_sync_c4,
     Float:g_spawns[MAX_SPAWNS+1][9], bool:g_infecting, bool:g_gamestarted, bool:g_roundstarted,
     bool:g_roundended, bool:g_allow_item, bool:g_setting_model, g_class_name[MAX_CLASSES+1][32],
     g_classcount, g_class_desc[MAX_CLASSES+1][32], g_class_pmodel[MAX_CLASSES+1][64],
@@ -234,9 +255,16 @@ new cvar_enabled, cvar_randomspawn, cvar_autonvg, cvar_winsounds, cvar_weaponsme
     cvar_knockback_duck, cvar_killreward, cvar_painshockfree, cvar_zombie_class,
     cvar_shootobjects, cvar_ammo, Float:cvar_starttime, Float:cvar_knockback_dist,
     Float:cvar_zombiemulti, Float:cvar_zombie_hpmulti, Float:cvar_pushpwr_weapon,
-    Float:cvar_pushpwr_zombie
+    Float:cvar_pushpwr_zombie, cvar_c4mission, Float:cvar_c4_planttime, Float:cvar_c4_radius,
+    cvar_zombie_respawn, Float:cvar_zombie_respawn_time, cvar_mutation_max, cvar_stats,
+    cvar_xp_infect, cvar_xp_kill, cvar_xp_bomb, cvar_maxlevel, cvar_class_motd, cvar_hud,
+    Float:cvar_mutation_health, Float:cvar_mutation_speed, Float:cvar_mutation_attack
 
-new bool:g_zombie[33], bool:g_disconnected[33], bool:g_showmenu[33], bool:g_menufailsafe[33],
+new HudSprite:g_hs_countdown[11], HudSprite:g_hs_mutation[6], HudSprite:g_hs_last,
+    HudSprite:g_hs_norespawn, HudSprite:g_hud_status[33][HUD_STATUS_COUNT], HudSprite:g_hud_shown[33],
+    g_hud_rot[33], bool:g_hud_off[33], Float:g_infect_time, g_cd_last,
+    g_class_motd_count, g_class_motd_path[96], g_vault, g_xp[33], g_level[33], g_stat_infects[33], g_stat_kills[33], g_stat_key[33][40],
+    bool:g_stats_loaded[33], g_mutation[33], bool:g_zrespawn[33], bool:g_zombie[33], bool:g_disconnected[33], bool:g_showmenu[33], bool:g_menufailsafe[33],
     bool:g_preinfect[33], bool:g_welcomemsg[33], bool:g_suicide[33], Float:g_regendelay[33],
     g_mutate[33], g_victim[33], g_menuposition[33], g_player_class[33], g_player_weapons[33][2]
 
@@ -289,6 +317,22 @@ public plugin_precache()
 	bind_int("bh_shootobjects", "1", cvar_shootobjects)
 	bind_float("bh_pushpwr_weapon", "2.0", cvar_pushpwr_weapon)
 	bind_float("bh_pushpwr_zombie", "5.0", cvar_pushpwr_zombie)
+	bind_int("bh_c4mission", "1", cvar_c4mission)
+	bind_int("bh_zombie_respawn", "1", cvar_zombie_respawn)
+	bind_int("bh_stats", "1", cvar_stats)
+	bind_int("bh_class_motd", "1", cvar_class_motd)
+	bind_int("bh_hud", "1", cvar_hud)
+	bind_int("bh_xp_infect", "5", cvar_xp_infect)
+	bind_int("bh_xp_kill", "10", cvar_xp_kill)
+	bind_int("bh_xp_bomb", "25", cvar_xp_bomb)
+	bind_int("bh_maxlevel", "50", cvar_maxlevel)
+	bind_int("bh_mutation_max", "3", cvar_mutation_max)
+	bind_float("bh_mutation_health", "50.0", cvar_mutation_health)
+	bind_float("bh_mutation_speed", "15.0", cvar_mutation_speed)
+	bind_float("bh_mutation_attack", "0.1", cvar_mutation_attack)
+	bind_float("bh_zombie_respawn_time", "3.0", cvar_zombie_respawn_time)
+	bind_float("bh_c4_planttime", "3.0", cvar_c4_planttime)
+	bind_float("bh_c4_radius", "120.0", cvar_c4_radius)
 
 	new file[64]
 	get_configsdir(file, charsmax(file))
@@ -332,6 +376,10 @@ public plugin_precache()
 	for(i = 0; i < sizeof g_survivor_win_sounds; i++)
 		precache_sound(g_survivor_win_sounds[i])
 
+	g_spr_ring = precache_model("sprites/white.spr")
+
+	hud_precache()
+
 	g_fwd_spawn = register_forward(FM_Spawn, "fwd_spawn")
 
 	g_buyzone = rg_create_entity("func_buyzone")
@@ -370,6 +418,10 @@ public plugin_init()
 	register_clcmd("say /class", "cmd_classmenu")
 	register_clcmd("say /guns", "cmd_enablemenu")
 	register_clcmd("say /help", "cmd_helpmotd")
+	register_clcmd("say /rank", "cmd_rank")
+	register_clcmd("say /hud", "cmd_hud")
+	register_clcmd("bh_class", "cmd_setclass")
+	register_clcmd("say /top", "cmd_top")
 	register_clcmd("amx_infect", "cmd_infectuser", ADMIN_BAN, "<name or #userid>")
 
 	register_menu("Equipment", 1023, "action_equip")
@@ -388,6 +440,8 @@ public plugin_init()
 	RegisterHookChain(RG_CBasePlayer_TakeDamage, "rg_player_takedamage_post", true)
 	RegisterHookChain(RG_CBasePlayer_TraceAttack, "rg_player_traceattack")
 	RegisterHookChain(RG_CBasePlayer_Killed, "rg_player_killed")
+	RegisterHookChain(RG_CBasePlayer_Killed, "rg_player_killed_post", true)
+	RegisterHookChain(RG_CGrenade_DefuseBombEnd, "rg_defuse_end_post", true)
 	RegisterHookChain(RG_HandleMenu_ChooseTeam, "rg_choose_team")
 	RegisterHookChain(RG_PlayerBlind, "rg_player_blind")
 	RegisterHookChain(RG_CSGameRules_FlPlayerFallDamage, "rg_fall_damage")
@@ -450,8 +504,18 @@ public plugin_init()
 
 	g_sync_hpdisplay = CreateHudSyncObj()
 	g_sync_msgdisplay = CreateHudSyncObj()
+	g_sync_c4 = CreateHudSyncObj()
 
 	g_maxplayers = get_maxplayers()
+
+	for(new id = 0; id <= MaxClients; id++)
+		hud_reset_player(id)
+
+	set_task(3.0, "task_hud_rotate", _, _, _, "b")
+
+	g_vault = nvault_open("biohazard_stats")
+	if(g_vault == INVALID_HANDLE)
+		log_amx("Could not open the nvault, stats will not be saved")
 
 	cache_weapon_ids()
 
@@ -468,6 +532,7 @@ public plugin_init()
 	}
 
 	set_task(0.05, "task_regen", _, _, _, "b")
+	set_task(0.1, "task_c4mission", _, _, _, "b")
 
 	if(cvar_showtruehealth)
 		set_task(0.2, "task_showtruehealth", _, _, _, "b")
@@ -475,8 +540,15 @@ public plugin_init()
 
 public plugin_end()
 {
-	if(cvar_enabled)
-		set_pcvar_num(g_cvar_autoteambalance, g_autoteambalance)
+	if(!cvar_enabled)
+		return
+
+	set_pcvar_num(g_cvar_autoteambalance, g_autoteambalance)
+
+	stats_save_all()
+
+	if(g_vault != INVALID_HANDLE)
+		nvault_close(g_vault)
 }
 
 public plugin_natives()
@@ -513,6 +585,8 @@ cache_weapon_ids()
 
 public client_connect(id)
 {
+	hud_reset_player(id)
+	g_hud_off[id] = false
 	g_showmenu[id] = true
 	g_welcomemsg[id] = true
 	g_zombie[id] = false
@@ -526,6 +600,8 @@ public client_connect(id)
 	g_player_weapons[id][0] = -1
 	g_player_weapons[id][1] = -1
 	g_regendelay[id] = 0.0
+	g_zrespawn[id] = false
+	g_mutation[id] = 0
 }
 
 public client_putinserver(id)
@@ -536,18 +612,106 @@ public client_putinserver(id)
 
 public client_disconnected(id)
 {
+	hud_check_later()
+
+	stats_save(id)
+	stats_clear(id)
+
 	remove_task(TASKID_UPDATESCR + id)
 	remove_task(TASKID_SPAWNDELAY + id)
 	remove_task(TASKID_WEAPONSMENU + id)
 	remove_task(TASKID_CHECKSPAWN + id)
+	remove_task(TASKID_ZRESPAWN + id)
 
+	g_zrespawn[id] = false
 	g_disconnected[id] = true
 }
 
 public cmd_classmenu(id)
 {
-	if(g_classcount > 1)
-		display_classmenu(id, g_menuposition[id] = 0)
+	if(g_classcount <= 1)
+		return
+
+	show_class_motd(id)
+	display_classmenu(id, g_menuposition[id] = 0)
+}
+
+// bh_class <number>: picks the class from the MOTD list (a MOTD cannot send clicks back)
+public cmd_setclass(id)
+{
+	if(g_classcount <= 1)
+		return PLUGIN_HANDLED
+
+	static arg[8], number
+	read_argv(1, arg, charsmax(arg))
+	number = str_to_num(arg)
+
+	if(number < 1 || number > g_classcount)
+	{
+		client_print(id, print_console, "Usage: bh_class <1-%d>", g_classcount)
+		return PLUGIN_HANDLED
+	}
+
+	set_next_class(id, number - 1)
+	return PLUGIN_HANDLED
+}
+
+// The class becomes active on the next infection
+set_next_class(id, class)
+{
+	g_mutate[id] = class
+	client_print(id, print_chat, "%L", id, "MENU_CHANGECLASS", g_class_name[class])
+}
+
+/* ------------------------------------------------------------------ */
+/* Class MOTD                                                          */
+/* ------------------------------------------------------------------ */
+
+// Writes the class list as an HTML page; rebuilt when the number of classes changed
+build_class_motd()
+{
+	static datadir[64]
+	get_datadir(datadir, charsmax(datadir))
+	formatex(g_class_motd_path, charsmax(g_class_motd_path), "%s/bh_classes.html", datadir)
+
+	new file = fopen(g_class_motd_path, "wt")
+	if(!file)
+		return
+
+	fputs(file, "<html><head><meta charset=^"utf-8^"><style>body{background:#111;color:#ddd;font-family:Verdana;font-size:12px;margin:8px}")
+	fputs(file, "h3{color:#f55}table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid #333;padding:4px;text-align:left}th{color:#f55}")
+	fputs(file, "td.n{color:#fc0;font-weight:bold}p{color:#999}</style></head><body><h3>Zombie Classes</h3><table>")
+	fputs(file, "<tr><th>#</th><th>Class</th><th>HP</th><th>Speed</th><th>Gravity</th><th>Attack</th><th>Description</th></tr>")
+
+	static name[64], desc[64], row[512], i
+	for(i = 0; i < g_classcount; i++)
+	{
+		copy(name, charsmax(name), g_class_name[i])
+		copy(desc, charsmax(desc), g_class_desc[i])
+
+		replace_all(name, charsmax(name), "<", "&lt;")
+		replace_all(desc, charsmax(desc), "<", "&lt;")
+
+		formatex(row, charsmax(row), "<tr><td class=^"n^">%d</td><td>%s</td><td>%.0f</td><td>%.0f</td><td>%.2f</td><td>x%.1f</td><td>%s</td></tr>",
+			i + 1, name, g_class_data[i][DATA_HEALTH], g_class_data[i][DATA_SPEED], g_class_data[i][DATA_GRAVITY], g_class_data[i][DATA_ATTACK], desc)
+
+		fputs(file, row)
+	}
+
+	fputs(file, "</table><p>Pick a class with the number keys of the menu, or type <b>bh_class &lt;number&gt;</b> in the console.<br>")
+	fputs(file, "The chosen class is used the next time you become a zombie.</p></body></html>")
+	fclose(file)
+
+	g_class_motd_count = g_classcount
+}
+
+show_class_motd(id)
+{
+	if(g_class_motd_count != g_classcount || !g_class_motd_path[0])
+		build_class_motd()
+
+	if(g_class_motd_path[0] && file_exists(g_class_motd_path))
+		show_motd(id, g_class_motd_path, "Zombie Classes")
 }
 
 public cmd_enablemenu(id)
@@ -686,12 +850,12 @@ public msg_textmsg(msgid, dest, id)
 	if(equal(txtmsg[1], "Game_bomb_drop"))
 		return PLUGIN_HANDLED
 
-	if(equal(txtmsg[1], "Terrorists_Win"))
+	if(equal(txtmsg[1], "Terrorists_Win") || equal(txtmsg[1], "Target_Bombed"))
 	{
 		formatex(winmsg, charsmax(winmsg), "%L", LANG_SERVER, "WIN_TXT_ZOMBIES")
 		set_msg_arg_string(2, winmsg)
 	}
-	else if(equal(txtmsg[1], "Target_Saved") || equal(txtmsg[1], "CTs_Win"))
+	else if(equal(txtmsg[1], "Target_Saved") || equal(txtmsg[1], "CTs_Win") || equal(txtmsg[1], "Bomb_Defused"))
 	{
 		formatex(winmsg, charsmax(winmsg), "%L", LANG_SERVER, "WIN_TXT_SURVIVORS")
 		set_msg_arg_string(2, winmsg)
@@ -710,6 +874,17 @@ public rg_round_restart_post()
 
 	g_zombies_exist = false
 	DisableHookChain(g_hc_impulse)
+	c4_reset()
+	countdown_start()
+
+	for(new id = 1; id <= g_maxplayers; id++)
+	{
+		hud_clear(id, HUD_LASTSURV)
+		hud_clear(id, HUD_NORESPAWN)
+		remove_task(TASKID_ZRESPAWN + id)
+		g_zrespawn[id] = false
+		g_mutation[id] = 0
+	}
 
 	if(cvar_buytime)
 	{
@@ -770,6 +945,11 @@ public rg_round_end_post(WinStatus:status, ScenarioEventEndRound:event, Float:de
 	remove_task(TASKID_STARTROUND)
 
 	set_task(0.1, "task_balanceteam", TASKID_BALANCETEAM)
+
+	countdown_stop()
+	hud_check_later()
+
+	stats_save_all()
 }
 
 public event_textmsg()
@@ -902,7 +1082,7 @@ public task_regen()
 		pclass = g_player_class[id]
 		pev(id, pev_health, health)
 
-		if(health >= g_class_data[pclass][DATA_HEALTH])
+		if(health >= zombie_max_health(id))
 			continue
 
 		set_pev(id, pev_health, health + 1.0)
@@ -998,7 +1178,7 @@ public rg_player_givedefaultitems(const id)
 public rg_player_resetmaxspeed(const id)
 {
 	if(g_zombie[id] && is_user_alive(id))
-		set_pev(id, pev_maxspeed, g_class_data[g_player_class[id]][DATA_SPEED])
+		set_pev(id, pev_maxspeed, g_class_data[g_player_class[id]][DATA_SPEED] + g_mutation[id] * cvar_mutation_speed)
 
 	return HC_CONTINUE
 }
@@ -1092,7 +1272,7 @@ public rg_player_takedamage(const victim, inflictor, attacker, Float:damage, dam
 			return HC_SUPERCEDE
 		}
 
-		damage *= g_class_data[g_player_class[attacker]][DATA_ATTACK]
+		damage *= g_class_data[g_player_class[attacker]][DATA_ATTACK] * (1.0 + g_mutation[attacker] * cvar_mutation_attack)
 
 		static Float:armor
 		pev(victim, pev_armorvalue, armor)
@@ -1159,6 +1339,10 @@ public rg_player_takedamage_post(const victim, inflictor, attacker, Float:damage
 	message_end()
 
 	infect_user(victim, attacker)
+	mutate_zombie(attacker)
+
+	g_stat_infects[attacker]++
+	award_xp(attacker, cvar_xp_infect)
 
 	static Float:frags
 	pev(attacker, pev_frags, frags)
@@ -1203,6 +1387,504 @@ public rg_player_killed(const victim, killer, shouldgib)
 	return HC_CONTINUE
 }
 
+// Zombie respawn: queued when a zombie dies, cancelled once one survivor is left
+public rg_player_killed_post(const victim, killer, shouldgib)
+{
+	hud_check_later()
+
+	// A zombie that kills a survivor mutates, a zombie that dies loses its mutations
+	if(!g_zombie[victim] && is_valid_player(killer) && g_zombie[killer])
+	{
+		mutate_zombie(killer)
+
+		g_stat_infects[killer]++
+		award_xp(killer, cvar_xp_infect)
+	}
+	else if(g_zombie[victim] && is_valid_player(killer) && !g_zombie[killer] && killer != victim)
+	{
+		g_stat_kills[killer]++
+		award_xp(killer, cvar_xp_kill)
+	}
+
+	if(g_zombie[victim] && g_mutation[victim])
+		mutation_reset(victim)
+
+	if(!cvar_zombie_respawn || !g_zombie[victim] || !g_gamestarted || g_roundended)
+		return HC_CONTINUE
+
+	if(count_survivors() <= 1)
+	{
+		client_print(victim, print_center, "Last survivor left, no respawn!")
+		return HC_CONTINUE
+	}
+
+	remove_task(TASKID_ZRESPAWN + victim)
+	set_task(cvar_zombie_respawn_time, "task_zombie_respawn", TASKID_ZRESPAWN + victim)
+
+	client_print(victim, print_center, "Respawning in %.0f seconds...", cvar_zombie_respawn_time)
+	return HC_CONTINUE
+}
+
+public task_zombie_respawn(taskid)
+{
+	static id, team
+	id = taskid - TASKID_ZRESPAWN
+
+	if(!cvar_zombie_respawn || !g_gamestarted || g_roundended || !is_user_connected(id) || is_user_alive(id) || !g_zombie[id])
+		return
+
+	team = get_member(id, m_iTeam)
+	if(!is_playing_team(team))
+		return
+
+	// The rule is checked again at respawn time, the survivor count may have changed
+	if(count_survivors() <= 1)
+	{
+		client_print(id, print_center, "Last survivor left, no respawn!")
+		return
+	}
+
+	g_zrespawn[id] = true
+	rg_round_respawn(id)
+}
+
+// Alive humans
+stock count_survivors()
+{
+	static id, count
+	count = 0
+
+	for(id = 1; id <= g_maxplayers; id++)
+	{
+		if(!g_zombie[id] && is_user_alive(id))
+			count++
+	}
+	return count
+}
+
+/* ------------------------------------------------------------------ */
+/* Persistent stats (nvault)                                           */
+/* ------------------------------------------------------------------ */
+
+// XP needed to reach a level: 100 * level^2
+stock xp_for_level(level)
+	return 100 * level * level
+
+stock level_from_xp(xp)
+	return min(floatround(floatsqroot(float(xp) / 100.0), floatround_floor), max(cvar_maxlevel, 0))
+
+stats_clear(id)
+{
+	g_xp[id] = 0
+	g_level[id] = 0
+	g_stat_infects[id] = 0
+	g_stat_kills[id] = 0
+	g_stats_loaded[id] = false
+	g_stat_key[id][0] = 0
+}
+
+public client_authorized(id, const authid[])
+{
+	if(!cvar_enabled || !cvar_stats || g_vault == INVALID_HANDLE || is_user_bot(id) || is_user_hltv(id))
+		return
+
+	stats_clear(id)
+
+	// LAN / pending ids are not unique, use the name for them
+	if(equal(authid, "STEAM_ID_LAN") || equal(authid, "VALVE_ID_LAN") || equal(authid, "STEAM_ID_PENDING") || equal(authid, "HLTV") || !authid[0])
+	{
+		static name[32]
+		get_user_name(id, name, charsmax(name))
+		formatex(g_stat_key[id], charsmax(g_stat_key[]), "N:%s", name)
+	}
+	else
+		copy(g_stat_key[id], charsmax(g_stat_key[]), authid)
+
+	static data[64], timestamp, a[12], b[12], c[12]
+
+	if(nvault_lookup(g_vault, g_stat_key[id], data, charsmax(data), timestamp))
+	{
+		parse(data, a, charsmax(a), b, charsmax(b), c, charsmax(c))
+
+		g_xp[id] = str_to_num(a)
+		g_stat_infects[id] = str_to_num(b)
+		g_stat_kills[id] = str_to_num(c)
+	}
+
+	g_level[id] = level_from_xp(g_xp[id])
+	g_stats_loaded[id] = true
+}
+
+stats_save(id)
+{
+	if(!g_stats_loaded[id] || g_vault == INVALID_HANDLE)
+		return
+
+	static data[64]
+	formatex(data, charsmax(data), "%d %d %d", g_xp[id], g_stat_infects[id], g_stat_kills[id])
+
+	nvault_set(g_vault, g_stat_key[id], data)
+}
+
+stats_save_all()
+{
+	for(new id = 1; id <= g_maxplayers; id++)
+	{
+		if(g_stats_loaded[id])
+			stats_save(id)
+	}
+}
+
+award_xp(id, amount)
+{
+	if(!cvar_stats || amount <= 0 || !is_valid_player(id) || !g_stats_loaded[id])
+		return
+
+	static newlevel
+	g_xp[id] += amount
+	newlevel = level_from_xp(g_xp[id])
+
+	if(newlevel <= g_level[id])
+		return
+
+	g_level[id] = newlevel
+
+	static name[32]
+	get_user_name(id, name, charsmax(name))
+
+	set_hudmessage(255, 215, 0, -1.0, 0.35, 0, 0.0, 4.0, 0.1, 0.5)
+	ShowSyncHudMsg(id, g_sync_msgdisplay, "LEVEL UP!^nYou reached level %d", newlevel)
+	client_print(0, print_chat, "[Biohazard] %s reached level %d!", name, newlevel)
+}
+
+public cmd_rank(id)
+{
+	if(!cvar_stats || !g_stats_loaded[id])
+	{
+		client_print(id, print_chat, "[Biohazard] Your stats are not available yet.")
+		return PLUGIN_HANDLED
+	}
+
+	static pos, total, other
+	pos = 1
+	total = 0
+
+	for(other = 1; other <= g_maxplayers; other++)
+	{
+		if(!g_stats_loaded[other])
+			continue
+
+		total++
+
+		if(g_xp[other] > g_xp[id])
+			pos++
+	}
+
+	if(g_level[id] >= cvar_maxlevel)
+		client_print(id, print_chat, "[Biohazard] Level %d (MAX), %d XP", g_level[id], g_xp[id])
+	else
+		client_print(id, print_chat, "[Biohazard] Level %d, %d/%d XP to level %d", g_level[id], g_xp[id], xp_for_level(g_level[id] + 1), g_level[id] + 1)
+
+	client_print(id, print_chat, "[Biohazard] Infections: %d, Zombie kills: %d, Rank: %d/%d online", g_stat_infects[id], g_stat_kills[id], pos, total)
+	return PLUGIN_HANDLED
+}
+
+// Top players currently on the server
+public cmd_top(id)
+{
+	static order[32], count, other, i, j, tmp, name[32]
+	count = 0
+
+	for(other = 1; other <= g_maxplayers; other++)
+	{
+		if(g_stats_loaded[other])
+			order[count++] = other
+	}
+
+	// Insertion sort by XP, highest first
+	for(i = 1; i < count; i++)
+	{
+		tmp = order[i]
+
+		for(j = i - 1; j >= 0 && g_xp[order[j]] < g_xp[tmp]; j--)
+			order[j + 1] = order[j]
+
+		order[j + 1] = tmp
+	}
+
+	client_print(id, print_chat, "[Biohazard] Top players online:")
+
+	for(i = 0; i < count && i < 5; i++)
+	{
+		get_user_name(order[i], name, charsmax(name))
+		client_print(id, print_chat, "%d. %s - Level %d (%d XP)", i + 1, name, g_level[order[i]], g_xp[order[i]])
+	}
+	return PLUGIN_HANDLED
+}
+
+/* ------------------------------------------------------------------ */
+/* HUD status icons (sprites_on_hud)                                   */
+/* ------------------------------------------------------------------ */
+
+// Must run in plugin_precache; missing sprite files just give InvalidHudSprite
+hud_precache()
+{
+	static name[32], i
+
+	for(i = 1; i <= 10; i++)
+	{
+		formatex(name, charsmax(name), "bh_cd_%d", i)
+		g_hs_countdown[i] = HS_PrecacheSprite(name, 0, HUD_OFFSET_Y)
+	}
+
+	for(i = 1; i <= 5; i++)
+	{
+		formatex(name, charsmax(name), "bh_mut_%d", i)
+		g_hs_mutation[i] = HS_PrecacheSprite(name, 0, HUD_OFFSET_Y)
+	}
+
+	g_hs_last = HS_PrecacheSprite("bh_last", 0, HUD_OFFSET_Y)
+	g_hs_norespawn = HS_PrecacheSprite("bh_norespawn", 0, HUD_OFFSET_Y)
+}
+
+hud_reset_player(id)
+{
+	for(new status = 0; status < HUD_STATUS_COUNT; status++)
+		g_hud_status[id][status] = InvalidHudSprite
+
+	g_hud_shown[id] = InvalidHudSprite
+	g_hud_rot[id] = 0
+}
+
+stock hud_set(id, status, HudSprite:sprite)
+{
+	if(!is_valid_player(id) || g_hud_status[id][status] == sprite)
+		return
+
+	g_hud_status[id][status] = sprite
+	hud_refresh(id)
+}
+
+stock hud_clear(id, status)
+	hud_set(id, status, InvalidHudSprite)
+
+// Shows the sprite of the active status; with several active ones the rotation index picks
+hud_refresh(id)
+{
+	if(!is_user_connected(id))
+		return
+
+	static HudSprite:list[HUD_STATUS_COUNT], HudSprite:target, count, status
+	count = 0
+
+	if(cvar_hud && !g_hud_off[id])
+	{
+		for(status = 0; status < HUD_STATUS_COUNT; status++)
+		{
+			if(g_hud_status[id][status] != InvalidHudSprite)
+				list[count++] = g_hud_status[id][status]
+		}
+	}
+
+	if(!count)
+	{
+		if(g_hud_shown[id] != InvalidHudSprite)
+		{
+			HS_ClearSprite(id)
+			g_hud_shown[id] = InvalidHudSprite
+		}
+		return
+	}
+
+	target = list[g_hud_rot[id] % count]
+
+	if(target != g_hud_shown[id])
+	{
+		HS_DrawSprite(id, target)
+		g_hud_shown[id] = target
+	}
+}
+
+// Every few seconds players with more than one active status see the next one
+public task_hud_rotate()
+{
+	if(!cvar_hud)
+		return
+
+	static id, status, active
+
+	for(id = 1; id <= g_maxplayers; id++)
+	{
+		if(!is_user_connected(id))
+			continue
+
+		active = 0
+
+		for(status = 0; status < HUD_STATUS_COUNT; status++)
+		{
+			if(g_hud_status[id][status] != InvalidHudSprite)
+				active++
+		}
+
+		if(active > 1)
+		{
+			g_hud_rot[id]++
+			hud_refresh(id)
+		}
+	}
+}
+
+public cmd_hud(id)
+{
+	g_hud_off[id] = !g_hud_off[id]
+	hud_refresh(id)
+
+	client_print(id, print_chat, "[Biohazard] HUD icons %s.", g_hud_off[id] ? "disabled" : "enabled")
+	return PLUGIN_HANDLED
+}
+
+// Last 10 seconds before the first zombie appears
+countdown_start()
+{
+	g_infect_time = get_gametime() + cvar_starttime
+	g_cd_last = 0
+
+	remove_task(TASKID_COUNTDOWN)
+
+	if(cvar_hud)
+		set_task(0.2, "task_countdown", TASKID_COUNTDOWN, _, _, "b")
+}
+
+countdown_stop()
+{
+	remove_task(TASKID_COUNTDOWN)
+	g_cd_last = 0
+
+	for(new id = 1; id <= g_maxplayers; id++)
+		hud_clear(id, HUD_COUNTDOWN)
+}
+
+public task_countdown()
+{
+	static remaining, id
+	remaining = floatround(g_infect_time - get_gametime(), floatround_ceil)
+
+	if(remaining < 1)
+	{
+		countdown_stop()
+		return
+	}
+
+	if(remaining > 10 || remaining == g_cd_last)
+		return
+
+	g_cd_last = remaining
+
+	for(id = 1; id <= g_maxplayers; id++)
+		hud_set(id, HUD_COUNTDOWN, g_hs_countdown[remaining])
+}
+
+// Last survivor gets a warning icon and so do zombies that can no longer respawn.
+// Coalesced so many events in the same moment cause a single scan.
+hud_check_later()
+{
+	if(!cvar_hud)
+		return
+
+	remove_task(TASKID_HUDCHECK)
+	set_task(0.1, "task_hud_check", TASKID_HUDCHECK)
+}
+
+public task_hud_check()
+{
+	static id, last
+	last = 0
+
+	if(g_gamestarted && !g_roundended && count_survivors() == 1)
+	{
+		for(id = 1; id <= g_maxplayers; id++)
+		{
+			if(!g_zombie[id] && is_user_alive(id))
+			{
+				last = id
+				break
+			}
+		}
+	}
+
+	for(id = 1; id <= g_maxplayers; id++)
+	{
+		if(!is_user_connected(id))
+			continue
+
+		if(id == last)
+			hud_set(id, HUD_LASTSURV, g_hs_last)
+		else
+			hud_clear(id, HUD_LASTSURV)
+
+		if(last && g_zombie[id] && cvar_zombie_respawn)
+			hud_set(id, HUD_NORESPAWN, g_hs_norespawn)
+		else
+			hud_clear(id, HUD_NORESPAWN)
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* Mutation: zombies get stronger with every survivor they take down   */
+/* ------------------------------------------------------------------ */
+
+stock Float:zombie_max_health(id)
+	return g_class_data[g_player_class[id]][DATA_HEALTH] + g_mutation[id] * cvar_mutation_health
+
+mutate_zombie(id)
+{
+	if(!is_valid_player(id) || !g_zombie[id] || !is_user_alive(id) || g_mutation[id] >= cvar_mutation_max)
+		return
+
+	static Float:health
+	g_mutation[id]++
+
+	// Instant heal for the bonus health, then the new speed
+	pev(id, pev_health, health)
+	set_pev(id, pev_health, floatmin(health + cvar_mutation_health, zombie_max_health(id)))
+	rg_reset_maxspeed(id)
+	mutation_glow(id)
+	hud_set(id, HUD_MUTATION, g_hs_mutation[min(g_mutation[id], 5)])
+
+	set_hudmessage(80, 255, 80, -1.0, 0.3, 0, 0.0, 3.0, 0.1, 0.5)
+	ShowSyncHudMsg(id, g_sync_msgdisplay, "MUTATION %d/%d^nStronger, faster, deadlier!", g_mutation[id], cvar_mutation_max)
+}
+
+mutation_reset(id)
+{
+	g_mutation[id] = 0
+	mutation_glow(id)
+	hud_clear(id, HUD_MUTATION)
+}
+
+// Glow shell gets stronger and redder with each level
+mutation_glow(id)
+{
+	static Float:color[3], Float:fraction
+
+	if(g_mutation[id] <= 0)
+	{
+		set_pev(id, pev_renderfx, kRenderFxNone)
+		set_pev(id, pev_renderamt, 0.0)
+		return
+	}
+
+	fraction = float(g_mutation[id]) / float(max(cvar_mutation_max, 1))
+
+	color[0] = 60.0 + 195.0 * fraction
+	color[1] = 255.0 - 215.0 * fraction
+	color[2] = 40.0
+
+	set_pev(id, pev_renderfx, kRenderFxGlowShell)
+	set_pev(id, pev_rendercolor, color)
+	set_pev(id, pev_renderamt, 10.0 + 20.0 * fraction)
+}
+
 reward_clip(id)
 {
 	static weapon, maxclip
@@ -1221,6 +1903,8 @@ reward_grenade(id)
 
 public rg_player_spawn_post(const id)
 {
+	hud_check_later()
+
 	if(!is_user_alive(id))
 		return HC_CONTINUE
 
@@ -1232,8 +1916,9 @@ public rg_player_spawn_post(const id)
 
 	if(g_zombie[id])
 	{
-		if(cvar_respawnaszombie && !g_roundended)
+		if((cvar_respawnaszombie || g_zrespawn[id]) && !g_roundended)
 		{
+			g_zrespawn[id] = false
 			set_zombie_attibutes(id)
 			return HC_CONTINUE
 		}
@@ -1458,6 +2143,12 @@ public task_spawned(taskid)
 		replace(message, charsmax(message), "#Version#", VERSION)
 
 		client_print(id, print_chat, message)
+
+		if(cvar_class_motd && g_classcount > 1)
+			cmd_classmenu(id)
+
+		if(g_stats_loaded[id])
+			client_print(id, print_chat, "[Biohazard] Level %d, %d XP. Type /rank for your stats, /top for the best players.", g_level[id], g_xp[id])
 	}
 
 	if(g_suicide[id])
@@ -1493,6 +2184,10 @@ public task_checkspawn(taskid)
 	if(g_roundended || !is_user_connected(id) || is_user_alive(id))
 		return
 
+	// Zombies are handled by the zombie respawn rules (no respawn for the last survivor)
+	if(g_zombie[id])
+		return
+
 	team = get_member(id, m_iTeam)
 
 	if(is_playing_team(team))
@@ -1513,9 +2208,9 @@ public task_showtruehealth()
 		class = g_player_class[id]
 
 		if(g_classcount > 1)
-			ShowSyncHudMsg(id, g_sync_hpdisplay, "Health: %0.f  Class: %s (%s)", health, g_class_name[class], g_class_desc[class])
+			ShowSyncHudMsg(id, g_sync_hpdisplay, "Health: %0.f  Class: %s (%s)  Mutation: %d/%d", health, g_class_name[class], g_class_desc[class], g_mutation[id], cvar_mutation_max)
 		else
-			ShowSyncHudMsg(id, g_sync_hpdisplay, "Health: %0.f", health)
+			ShowSyncHudMsg(id, g_sync_hpdisplay, "Health: %0.f  Mutation: %d/%d", health, g_mutation[id], cvar_mutation_max)
 	}
 }
 
@@ -1588,6 +2283,8 @@ public task_newround()
 
 public task_initround()
 {
+	countdown_stop()
+
 	static players[32], num, i, id, zombiecount, newzombie
 	get_players(players, num, "a")
 
@@ -1642,6 +2339,175 @@ public task_startround()
 {
 	g_gamestarted = true
 	ExecuteForward(g_fwd_gamestart, g_fwd_result)
+
+	hud_check_later()
+
+	c4_start()
+}
+
+/* ------------------------------------------------------------------ */
+/* C4 mission                                                          */
+/* ------------------------------------------------------------------ */
+
+c4_reset()
+{
+	g_c4_active = false
+
+	for(new id = 1; id <= g_maxplayers; id++)
+	{
+		if(g_c4_progress[id] > 0.0)
+			rg_send_bartime(id, 0)
+
+		g_c4_progress[id] = 0.0
+	}
+}
+
+// Picks a random spawn point as the bomb site; zombies must plant the C4 there
+c4_start()
+{
+	if(!cvar_c4mission || g_spawncount <= 0 || rg_is_bomb_planted())
+		return
+
+	copy_spawn_vec(g_c4_site, _random(g_spawncount), 0)
+	g_c4_active = true
+
+	// The bomb target scenario must be known to the game rules for the bomb to end the round
+	set_member_game(m_bTargetBombed, false)
+	set_member_game(m_bMapHasBombTarget, true)
+
+	set_hudmessage(255, 60, 60, -1.0, 0.25, 1, 0.0, 6.0, 0.2, 0.2)
+	ShowSyncHudMsg(0, g_sync_c4, "C4 MISSION^nZombies: plant the bomb at the marked ring (hold E)^nSurvivors: stop them and defuse it!")
+	client_print(0, print_chat, "[Biohazard] C4 mission started! Zombies must plant the bomb at the red ring.")
+}
+
+public task_c4mission()
+{
+	if(!g_c4_active)
+		return
+
+	if(!g_gamestarted || rg_is_bomb_planted())
+	{
+		// Planted by us (or a round ended): stop tracking
+		c4_reset()
+		return
+	}
+
+	static id, bool:inzone, Float:origin[3], Float:radius, Float:planttime, Float:now
+	static ticks
+	radius = cvar_c4_radius
+	planttime = cvar_c4_planttime
+
+	for(id = 1; id <= g_maxplayers; id++)
+	{
+		inzone = false
+
+		if(g_zombie[id] && is_user_alive(id))
+		{
+			pev(id, pev_origin, origin)
+			inzone = (get_distance_f(origin, g_c4_site) <= radius)
+		}
+
+		if(!inzone || !(pev(id, pev_button) & IN_USE))
+		{
+			if(g_c4_progress[id] > 0.0)
+			{
+				g_c4_progress[id] = 0.0
+				rg_send_bartime(id, 0)
+			}
+			continue
+		}
+
+		if(g_c4_progress[id] <= 0.0)
+			rg_send_bartime(id, max(1, floatround(planttime)))
+
+		g_c4_progress[id] += 0.1
+
+		if(g_c4_progress[id] >= planttime)
+		{
+			c4_plant(id)
+			return
+		}
+	}
+
+	// Once a second: draw the site ring and hint zombies standing in it
+	if(++ticks < 10)
+		return
+
+	ticks = 0
+	now = float(floatround(radius))
+
+	message_begin(MSG_BROADCAST, SVC_TEMPENTITY)
+	write_byte(TE_BEAMCYLINDER)
+	engfunc(EngFunc_WriteCoord, g_c4_site[0])
+	engfunc(EngFunc_WriteCoord, g_c4_site[1])
+	engfunc(EngFunc_WriteCoord, g_c4_site[2])
+	engfunc(EngFunc_WriteCoord, g_c4_site[0])
+	engfunc(EngFunc_WriteCoord, g_c4_site[1])
+	engfunc(EngFunc_WriteCoord, g_c4_site[2] + now)
+	write_short(g_spr_ring)
+	write_byte(0)
+	write_byte(0)
+	write_byte(10)
+	write_byte(8)
+	write_byte(0)
+	write_byte(255)
+	write_byte(40)
+	write_byte(40)
+	write_byte(200)
+	write_byte(0)
+	message_end()
+
+	for(id = 1; id <= g_maxplayers; id++)
+	{
+		if(g_zombie[id] && g_c4_progress[id] <= 0.0 && is_user_alive(id))
+		{
+			pev(id, pev_origin, origin)
+
+			if(get_distance_f(origin, g_c4_site) <= radius)
+				client_print(id, print_center, "Hold E to plant the C4")
+		}
+	}
+}
+
+c4_plant(planter)
+{
+	static Float:origin[3], Float:angles[3], flags, ent
+
+	pev(planter, pev_origin, origin)
+	pev(planter, pev_angles, angles)
+	flags = pev(planter, pev_flags)
+
+	// Put the bomb on the floor under the planter
+	origin[2] -= (flags & FL_DUCKING) ? 18.0 : 36.0
+	angles[0] = 0.0
+	angles[2] = 0.0
+
+	ent = rg_plant_bomb(planter, origin, angles)
+	c4_reset()
+
+	if(ent <= 0)
+		return
+
+	static name[32]
+	get_user_name(planter, name, charsmax(name))
+
+	set_hudmessage(255, 60, 60, -1.0, 0.25, 1, 0.0, 6.0, 0.2, 0.2)
+	ShowSyncHudMsg(0, g_sync_c4, "%s planted the C4!^nSurvivors: defuse it before it explodes!", name)
+	client_print(0, print_chat, "[Biohazard] %s planted the C4! Survivors must defuse it.", name)
+	award_xp(planter, cvar_xp_bomb)
+}
+
+public rg_defuse_end_post(const bomb, const player, bool:bDefused)
+{
+	if(!bDefused || !is_valid_player(player))
+		return HC_CONTINUE
+
+	static name[32]
+	get_user_name(player, name, charsmax(name))
+
+	client_print(0, print_chat, "[Biohazard] %s defused the C4! Survivors win.", name)
+	award_xp(player, cvar_xp_bomb)
+	return HC_CONTINUE
 }
 
 public task_balanceteam()
@@ -1721,6 +2587,8 @@ infect_user(victim, attacker)
 
 	emit_sound(victim, CHAN_STATIC, g_scream_sounds[_random(sizeof g_scream_sounds)], VOL_NORM, ATTN_NONE, 0, PITCH_NORM)
 	ExecuteForward(g_fwd_infect, g_fwd_result, victim, attacker)
+
+	hud_check_later()
 }
 
 cure_user(id)
@@ -1732,6 +2600,7 @@ cure_user(id)
 	was_zombie = g_zombie[id]
 
 	g_zombie[id] = false
+	mutation_reset(id)
 
 	rg_reset_user_model(id, true)
 	set_member(id, m_bHasNightVision, false)
@@ -1772,7 +2641,7 @@ set_zombie_attibutes(const index)
 	}
 
 	new iClass = g_player_class[index]
-	new Float:flHealth = g_class_data[iClass][DATA_HEALTH]
+	new Float:flHealth = g_class_data[iClass][DATA_HEALTH] + g_mutation[index] * cvar_mutation_health
 
 	if(g_preinfect[index])
 		flHealth *= cvar_zombie_hpmulti
@@ -2003,8 +2872,7 @@ public action_class(id, key)
 		case 9: display_classmenu(id, --g_menuposition[id])
 		default:
 		{
-			g_mutate[id] = g_menuposition[id] * 8 + key
-			client_print(id, print_chat, "%L", id, "MENU_CHANGECLASS", g_class_name[g_mutate[id]])
+			set_next_class(id, g_menuposition[id] * 8 + key)
 		}
 	}
 	return PLUGIN_HANDLED
