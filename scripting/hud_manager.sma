@@ -28,6 +28,7 @@
 #include <hud_manager>
 
 #define SLOT_WELCOME 0
+#define SLOT_BASE 6
 #define SLOT_SCORE 7
 #define SLOT_COUNT 8
 
@@ -185,7 +186,7 @@ public bool:native_set_status(plugin, params)
 {
 	new id = get_param(1), slot = get_param(2)
 
-	if(id < 1 || id > MaxClients || slot < HM_SLOT_FIRST || slot > HM_SLOT_LAST)
+	if(id < 1 || id > MaxClients || slot < HM_SLOT_FIRST || slot > HM_SLOT_BASE)
 		return false
 
 	set_status(id, slot, HudSprite:get_param(3), Float:get_param_f(4))
@@ -196,7 +197,7 @@ public bool:native_clear_status(plugin, params)
 {
 	new id = get_param(1), slot = get_param(2)
 
-	if(id < 1 || id > MaxClients || slot < HM_SLOT_FIRST || slot > HM_SLOT_LAST)
+	if(id < 1 || id > MaxClients || slot < HM_SLOT_FIRST || slot > HM_SLOT_BASE)
 		return false
 
 	set_status(id, slot, InvalidHudSprite)
@@ -242,15 +243,18 @@ refresh(id)
 	{
 		for(slot = 1; slot < SLOT_COUNT; slot++)
 		{
-			if(g_status[id][slot] != InvalidHudSprite)
+			if(slot != SLOT_BASE && g_status[id][slot] != InvalidHudSprite)
 				list[count++] = g_status[id][slot]
 		}
 	}
 
+	// Welcome banner alone, then the active icons in turns, the base layer when nothing else is active
 	if(!g_hidden[id] && g_status[id][SLOT_WELCOME] != InvalidHudSprite)
 		target = g_status[id][SLOT_WELCOME]
 	else if(count)
 		target = list[g_rotation[id] % count]
+	else if(!g_hidden[id])
+		target = g_status[id][SLOT_BASE]
 	else
 		target = InvalidHudSprite
 
@@ -278,7 +282,7 @@ public task_rotate()
 
 		for(slot = 1; slot < SLOT_COUNT; slot++)
 		{
-			if(g_status[id][slot] != InvalidHudSprite)
+			if(slot != SLOT_BASE && g_status[id][slot] != InvalidHudSprite)
 				active++
 		}
 
