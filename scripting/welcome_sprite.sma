@@ -11,6 +11,10 @@
 *     frames 12-17  a shine sweeps over the finished text (loops while the banner is up)
 *  The fade in and fade out are done with the render amount, they need no extra frames.
 *
+*  Motion (ws_motion 1): the banner slides in from the left with an ease-out and grows from 60% to
+*  full size, floats up and down gently while it is shown and drifts upwards while it fades away.
+*  (mode 0 can only do the grow, its position is fixed to the model attachment.)
+*
 *  Cvars (server.cfg):
 *    ws_time    7.0    seconds the banner stays, 0 disables it
 *    ws_mode    1      1 = floats in front of the eyes (position is fully predictable)
@@ -19,6 +23,8 @@
 *    ws_dist    32.0   mode 1: distance in front of the eyes
 *    ws_height  10.0   mode 1: how far above the crosshair
 *    ws_attach  4      mode 0: attachment point of the player model
+*    ws_motion  1      slide / grow / float motion, 0 = banner stays still
+*    ws_slide   40.0   mode 1: how far to the left the slide starts (world units)
 *  Player command: say /welcome shows the banner again.
 */
 
@@ -48,6 +54,10 @@
 #define REVEAL_TIME 1.0
 #define FADE_IN_TIME 0.3
 #define FADE_OUT_TIME 0.7
+#define SLIDE_TIME 0.6
+#define BOB_SPEED 3.0
+#define BOB_RANGE 1.2
+#define DRIFT_UP 8.0
 
 #define TASKID_SHOW 200
 #define TASKID_ANIM 300
@@ -90,7 +100,7 @@ new g_ent[33], Float:g_start[33], bool:g_pending[33]
 new g_active, g_fwd_think, g_isz_sprite
 new bool:g_ready
 
-new cvar_mode, cvar_attach, Float:cvar_time, Float:cvar_scale, Float:cvar_dist, Float:cvar_height
+new cvar_mode, cvar_attach, cvar_motion, Float:cvar_slide, Float:cvar_time, Float:cvar_scale, Float:cvar_dist, Float:cvar_height
 
 public plugin_precache()
 {
@@ -100,6 +110,8 @@ public plugin_precache()
 	bind_pcvar_float(register_cvar("ws_dist", "32.0"), cvar_dist)
 	bind_pcvar_float(register_cvar("ws_height", "10.0"), cvar_height)
 	bind_pcvar_num(register_cvar("ws_attach", "4"), cvar_attach)
+	bind_pcvar_num(register_cvar("ws_motion", "1"), cvar_motion)
+	bind_pcvar_float(register_cvar("ws_slide", "40.0"), cvar_slide)
 
 	write_banner_sprite()
 
@@ -245,10 +257,11 @@ banner_remove(id)
 	}
 }
 
-// Mode 1: keeps the sprite in front of the eyes of its owner
+// Mode 1: keeps the sprite in front of the eyes of its owner, with the slide / float motion
 follow_view(id, ent)
 {
 	static Float:origin[3], Float:offset[3], Float:angles[3], Float:forward_vec[3], Float:right_vec[3], Float:up_vec[3]
+	static Float:elapsed, Float:progress, Float:slide, Float:lift, Float:duration
 
 	pev(id, pev_origin, origin)
 	pev(id, pev_view_ofs, offset)
@@ -256,9 +269,34 @@ follow_view(id, ent)
 
 	engfunc(EngFunc_AngleVectors, angles, forward_vec, right_vec, up_vec)
 
-	origin[0] += offset[0] + forward_vec[0] * cvar_dist + up_vec[0] * cvar_height
-	origin[1] += offset[1] + forward_vec[1] * cvar_dist + up_vec[1] * cvar_height
-	origin[2] += offset[2] + forward_vec[2] * cvar_dist + up_vec[2] * cvar_height
+	slide = 0.0
+	lift = cvar_height
+
+	if(cvar_motion)
+	{
+		elapsed = get_gametime() - g_start[id]
+		duration = cvar_time
+
+		// Slide in from the left, ease-out: fast at first and settling softly
+		if(elapsed < SLIDE_TIME)
+		{
+			progress = 1.0 - elapsed / SLIDE_TIME
+			slide = -cvar_slide * progress * progress * progress
+		}
+		else
+		{
+			// Floating up and down
+			lift += floatsin(elapsed * BOB_SPEED, radian) * BOB_RANGE
+		}
+
+		// Drift upwards while fading out
+		if(elapsed > duration - FADE_OUT_TIME)
+			lift += DRIFT_UP * (1.0 - (duration - elapsed) / FADE_OUT_TIME)
+	}
+
+	origin[0] += offset[0] + forward_vec[0] * cvar_dist + right_vec[0] * slide + up_vec[0] * lift
+	origin[1] += offset[1] + forward_vec[1] * cvar_dist + right_vec[1] * slide + up_vec[1] * lift
+	origin[2] += offset[2] + forward_vec[2] * cvar_dist + right_vec[2] * slide + up_vec[2] * lift
 
 	engfunc(EngFunc_SetOrigin, ent, origin)
 }
@@ -274,7 +312,7 @@ public fwd_postthink(id)
 // Animation: the frame follows the time (state driven like the progress bar), alpha fades
 public task_anim()
 {
-	static id, ent, frame, Float:elapsed, Float:amount, Float:duration
+	static id, ent, frame, Float:elapsed, Float:amount, Float:duration, Float:progress
 
 	duration = cvar_time
 
@@ -307,6 +345,17 @@ public task_anim()
 
 		set_pev(ent, pev_frame, float(frame))
 		set_pev(ent, pev_renderamt, amount)
+
+		// Grows from 60% to full size while it slides in
+		if(cvar_motion && elapsed < SLIDE_TIME)
+		{
+			progress = 1.0 - elapsed / SLIDE_TIME
+			set_pev(ent, pev_scale, cvar_scale * (1.0 - 0.4 * progress * progress * progress))
+		}
+		else if(cvar_motion && elapsed < SLIDE_TIME + 0.15)
+		{
+			set_pev(ent, pev_scale, cvar_scale)
+		}
 	}
 
 	if(!g_active)
