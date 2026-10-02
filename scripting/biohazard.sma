@@ -1,32 +1,36 @@
 /*
-*  Biohazard 2.00 Beta 3 - modernized / performance build
+*  Biohazard 2.00 Beta 3 - ReAPI build
 *
 *  Original author: cheap_suit
 *
-*  Requires AMX Mod X 1.9.0 or greater (bind_pcvar_*, RegisterHamPlayer).
+*  Requires: AMX Mod X 1.9+, ReHLDS, ReGameDLL_CS and the ReAPI module.
 *
-*  Main changes compared to the original:
-*   - Every cvar used in a hot path is bound with bind_pcvar_*; no get_pcvar_*
-*     call is made per frame / per message any more.
-*   - Per-frame forwards (PreThink / PostThink / CmdStart / EmitSound) test the
-*     cheap g_zombie[] flag first and only then call natives.
-*   - RegisterHamPlayer replaces the CZ bot RegisterHamFromEntity workaround
-*     (and its polling task).
-*   - Weapon ids are resolved once at map start instead of on every equip.
-*   - Corpse model lookup uses the cached model entity, not an entity search.
-*   - Fixed bugs: fm_lastprimary/secondry/knife macros ignored their argument,
-*     bacon_touch_pushable never stored the movetype, task_newround could loop
-*     forever when the zombie ratio was larger than the player count,
-*     task_initround indexed an empty player list, shadowed `static i`,
-*     unchecked entity 0 when giving ammo, stale static in event_curweapon.
+*  What ReAPI replaced compared to the Ham Sandwich / pdata original:
+*   - Ham_TakeDamage / Killed / Spawn / TraceAttack / Touch(weapon) hooks
+*     -> RegisterHookChain on CBasePlayer (no CZ bot workaround needed)
+*   - HLTV event + Round_Start / Round_End log events
+*     -> RG_CSGameRules_RestartRound / OnRoundFreezeEnd / RG_RoundEnd
+*   - Weapon strip / give / replace / bp ammo, raw pdata offsets and last-item
+*     lookups -> rg_remove_all_items, rg_give_item(GT_REPLACE), rg_*_bpammo
+*   - Team, deaths, money, armor, night vision pdata -> rg_set_user_team,
+*     get/set_member, rg_add_account, rg_set_user_armor
+*   - Follower "player_model" entity + render hacks -> rg_set_user_model
+*   - Zombie knife view model (stripngive task, CurWeapon event) -> pre hook on
+*     DefaultDeploy, and AddPlayerItem is blocked so zombies cannot pick up guns
+*   - Pain shock free velocity restore (PreThink pre/post) -> m_flVelocityModifier
+*   - Fall damage "watertype" trick -> DMG_FALL blocked in TakeDamage
+*   - Flashlight block (FM_CmdStart) -> RG_CBasePlayer_ImpulseCommands
+*   - Random spawns task -> RG_CSGameRules_GetPlayerSpawnSpot
+*   - Ham_CS_RoundRespawn -> rg_round_respawn
 */
 
-#define VERSION	"2.00 Beta 3"
+#define VERSION	"2.00 Beta 3 ReAPI"
 
 #include <amxmodx>
 #include <amxmisc>
 #include <fakemeta>
 #include <hamsandwich>
+#include <reapi>
 #include <xs>
 
 #tryinclude "biohazard.cfg"
@@ -37,32 +41,6 @@
 	#assert AMX Mod X v1.9.0 or greater required!
 #endif
 
-#define OFFSET_DEATH 444
-#define OFFSET_TEAM 114
-#define OFFSET_ARMOR 112
-#define OFFSET_NVG 129
-#define OFFSET_CSMONEY 115
-#define OFFSET_PRIMARYWEAPON 116
-#define OFFSET_WEAPONTYPE 43
-#define OFFSET_CLIPAMMO	51
-#define EXTRAOFFSET_WEAPONS 4
-
-#define OFFSET_AMMO_338MAGNUM 377
-#define OFFSET_AMMO_762NATO 378
-#define OFFSET_AMMO_556NATOBOX 379
-#define OFFSET_AMMO_556NATO 380
-#define OFFSET_AMMO_BUCKSHOT 381
-#define OFFSET_AMMO_45ACP 382
-#define OFFSET_AMMO_57MM 383
-#define OFFSET_AMMO_50AE 384
-#define OFFSET_AMMO_357SIG 385
-#define OFFSET_AMMO_9MM 386
-
-#define OFFSET_LASTPRIM 368
-#define OFFSET_LASTSEC 369
-#define OFFSET_LASTKNI 370
-
-#define TASKID_STRIPNGIVE 698
 #define TASKID_NEWROUND	641
 #define TASKID_INITROUND 222
 #define TASKID_STARTROUND 153
@@ -77,12 +55,8 @@
 #define EQUIP_GREN (1<<2)
 #define EQUIP_ALL (1<<0 | 1<<1 | 1<<2)
 
-#define HAS_NVG (1<<0)
 #define ATTRIB_BOMB (1<<1)
 #define DMG_HEGRENADE (1<<24)
-
-#define MODEL_CLASSNAME "player_model"
-#define IMPULSE_FLASHLIGHT 100
 
 #define MAX_SPAWNS 128
 #define MAX_CLASSES 10
@@ -101,24 +75,10 @@
 #define DATA_HITREGENDLY 9
 #define DATA_KNOCKBACK 10
 
-#define fm_get_user_team(%1) get_pdata_int(%1, OFFSET_TEAM)
-#define fm_get_user_deaths(%1) get_pdata_int(%1, OFFSET_DEATH)
-#define fm_set_user_deaths(%1,%2) set_pdata_int(%1, OFFSET_DEATH, %2)
-#define fm_get_user_money(%1) get_pdata_int(%1, OFFSET_CSMONEY)
-#define fm_get_user_armortype(%1) get_pdata_int(%1, OFFSET_ARMOR)
-#define fm_set_user_armortype(%1,%2) set_pdata_int(%1, OFFSET_ARMOR, %2)
-#define fm_get_weapon_id(%1) get_pdata_int(%1, OFFSET_WEAPONTYPE, EXTRAOFFSET_WEAPONS)
-#define fm_get_weapon_ammo(%1) get_pdata_int(%1, OFFSET_CLIPAMMO, EXTRAOFFSET_WEAPONS)
-#define fm_set_weapon_ammo(%1,%2) set_pdata_int(%1, OFFSET_CLIPAMMO, %2, EXTRAOFFSET_WEAPONS)
-#define fm_reset_user_primary(%1) set_pdata_int(%1, OFFSET_PRIMARYWEAPON, 0)
-#define fm_lastprimary(%1) get_pdata_cbase(%1, OFFSET_LASTPRIM)
-#define fm_lastsecondry(%1) get_pdata_cbase(%1, OFFSET_LASTSEC)
-#define fm_lastknife(%1) get_pdata_cbase(%1, OFFSET_LASTKNI)
-#define fm_get_user_model(%1,%2,%3) engfunc(EngFunc_InfoKeyValue, engfunc(EngFunc_GetInfoKeyBuffer, %1), "model", %2, %3)
-
 #define _random(%1) random_num(0, %1 - 1)
 #define AMMOWP_NULL (1<<0 | 1<<CSW_KNIFE | 1<<CSW_FLASHBANG | 1<<CSW_HEGRENADE | 1<<CSW_SMOKEGRENADE | 1<<CSW_C4)
 #define is_valid_player(%1) (1 <= %1 <= MaxClients)
+#define is_playing_team(%1) (%1 == TEAM_TERRORIST || %1 == TEAM_CT)
 
 enum
 {
@@ -130,21 +90,6 @@ enum
 {
 	MENU_PRIMARY = 1,
 	MENU_SECONDARY
-}
-
-enum
-{
-	CS_TEAM_UNASSIGNED = 0,
-	CS_TEAM_T,
-	CS_TEAM_CT,
-	CS_TEAM_SPECTATOR
-}
-
-enum
-{
-	CS_ARMOR_NONE = 0,
-	CS_ARMOR_KEVLAR,
-	CS_ARMOR_VESTHELM
 }
 
 enum
@@ -260,24 +205,16 @@ new const g_dataname[][] =
 	"KNOCKBACK"
 }
 
-new const g_teaminfo[][] =
-{
-	"UNASSIGNED",
-	"TERRORIST",
-	"CT",
-	"SPECTATOR"
-}
-
 new g_maxplayers, g_spawncount, g_buyzone, g_sync_hpdisplay, g_sync_msgdisplay, g_fwd_spawn,
-    g_fwd_result, g_fwd_infect, g_fwd_gamestart, g_msg_flashlight, g_msg_teaminfo,
-    g_msg_scoreattrib, g_msg_money, g_msg_scoreinfo, g_msg_deathmsg, g_msg_screenfade,
-    Float:g_buytime, Float:g_spawns[MAX_SPAWNS+1][9], Float:g_vecvel[3], bool:g_brestorevel,
-    bool:g_infecting, bool:g_gamestarted, bool:g_roundstarted, bool:g_roundended,
-    g_class_name[MAX_CLASSES+1][32], g_classcount, g_class_desc[MAX_CLASSES+1][32],
-    g_class_pmodel[MAX_CLASSES+1][64], g_class_wmodel[MAX_CLASSES+1][64],
-    Float:g_class_data[MAX_CLASSES+1][MAX_DATA], g_autoteambalance, g_cvar_autoteambalance,
-    g_primary_wid[MAX_WEAPONS], g_secondary_wid[MAX_WEAPONS], g_grenade_wid[MAX_WEAPONS],
-    g_gamedesc[32], g_lights[2], g_skyname[32]
+    g_fwd_result, g_fwd_infect, g_fwd_gamestart, g_msg_flashlight, g_msg_scoreattrib,
+    g_msg_deathmsg, g_msg_screenfade, g_msg_scoreinfo, Float:g_buytime,
+    Float:g_spawns[MAX_SPAWNS+1][9], bool:g_infecting, bool:g_gamestarted, bool:g_roundstarted,
+    bool:g_roundended, bool:g_allow_item, bool:g_setting_model, g_class_name[MAX_CLASSES+1][32],
+    g_classcount, g_class_desc[MAX_CLASSES+1][32], g_class_pmodel[MAX_CLASSES+1][64],
+    g_class_wmodel[MAX_CLASSES+1][64], Float:g_class_data[MAX_CLASSES+1][MAX_DATA],
+    g_autoteambalance, g_cvar_autoteambalance, g_primary_wid[MAX_WEAPONS],
+    g_secondary_wid[MAX_WEAPONS], g_grenade_wid[MAX_WEAPONS], g_gamedesc[32], g_lights[2],
+    g_skyname[32]
 
 // Cvar values, kept in sync automatically through bind_pcvar_*
 new cvar_enabled, cvar_randomspawn, cvar_autonvg, cvar_winsounds, cvar_weaponsmenu,
@@ -285,14 +222,13 @@ new cvar_enabled, cvar_randomspawn, cvar_autonvg, cvar_winsounds, cvar_weaponsme
     cvar_punishsuicide, cvar_infectmoney, cvar_showtruehealth, cvar_obeyarmor,
     cvar_impactexplode, cvar_caphealthdisplay, cvar_randomclass, cvar_knockback,
     cvar_knockback_duck, cvar_killreward, cvar_painshockfree, cvar_zombie_class,
-    cvar_shootobjects, cvar_ammo,
-    Float:cvar_starttime, Float:cvar_knockback_dist, Float:cvar_zombiemulti,
-    Float:cvar_zombie_hpmulti, Float:cvar_pushpwr_weapon, Float:cvar_pushpwr_zombie
+    cvar_shootobjects, cvar_ammo, Float:cvar_starttime, Float:cvar_knockback_dist,
+    Float:cvar_zombiemulti, Float:cvar_zombie_hpmulti, Float:cvar_pushpwr_weapon,
+    Float:cvar_pushpwr_zombie
 
-new bool:g_zombie[33], bool:g_falling[33], bool:g_disconnected[33], bool:g_blockmodel[33],
-    bool:g_showmenu[33], bool:g_menufailsafe[33], bool:g_preinfect[33], bool:g_welcomemsg[33],
-    bool:g_suicide[33], Float:g_regendelay[33], Float:g_hitdelay[33], g_mutate[33], g_victim[33],
-    g_modelent[33], g_menuposition[33], g_player_class[33], g_player_weapons[33][2]
+new bool:g_zombie[33], bool:g_disconnected[33], bool:g_showmenu[33], bool:g_menufailsafe[33],
+    bool:g_preinfect[33], bool:g_welcomemsg[33], bool:g_suicide[33], Float:g_regendelay[33],
+    g_mutate[33], g_victim[33], g_menuposition[33], g_player_class[33], g_player_weapons[33][2]
 
 stock bind_int(const name[], const value[], &var)
 	bind_pcvar_num(register_cvar(name, value), var)
@@ -383,6 +319,9 @@ public plugin_precache()
 	for(i = 0; i < sizeof g_zombie_win_sounds; i++)
 		precache_sound(g_zombie_win_sounds[i])
 
+	for(i = 0; i < sizeof g_survivor_win_sounds; i++)
+		precache_sound(g_survivor_win_sounds[i])
+
 	g_fwd_spawn = register_forward(FM_Spawn, "fwd_spawn")
 
 	g_buyzone = engfunc(EngFunc_CreateNamedEntity, engfunc(EngFunc_AllocString, "func_buyzone"))
@@ -430,21 +369,33 @@ public plugin_init()
 	register_menu("Class", 1023, "action_class")
 
 	unregister_forward(FM_Spawn, g_fwd_spawn)
-	register_forward(FM_CmdStart, "fwd_cmdstart")
 	register_forward(FM_EmitSound, "fwd_emitsound")
 	register_forward(FM_GetGameDescription, "fwd_gamedescription")
 	register_forward(FM_CreateNamedEntity, "fwd_createnamedentity")
 	register_forward(FM_ClientKill, "fwd_clientkill")
-	register_forward(FM_PlayerPreThink, "fwd_player_prethink")
-	register_forward(FM_PlayerPreThink, "fwd_player_prethink_post", 1)
-	register_forward(FM_PlayerPostThink, "fwd_player_postthink")
-	register_forward(FM_SetClientKeyValue, "fwd_setclientkeyvalue")
 
-	// RegisterHamPlayer also covers CZ bots automatically
-	RegisterHamPlayer(Ham_TakeDamage, "bacon_takedamage_player")
-	RegisterHamPlayer(Ham_Killed, "bacon_killed_player")
-	RegisterHamPlayer(Ham_Spawn, "bacon_spawn_player_post", 1)
-	RegisterHamPlayer(Ham_TraceAttack, "bacon_traceattack_player")
+	// Player
+	RegisterHookChain(RG_CBasePlayer_Spawn, "rg_player_spawn_post", true)
+	RegisterHookChain(RG_CBasePlayer_TakeDamage, "rg_player_takedamage")
+	RegisterHookChain(RG_CBasePlayer_TakeDamage, "rg_player_takedamage_post", true)
+	RegisterHookChain(RG_CBasePlayer_TraceAttack, "rg_player_traceattack")
+	RegisterHookChain(RG_CBasePlayer_Killed, "rg_player_killed")
+	RegisterHookChain(RG_CBasePlayer_PreThink, "rg_player_prethink")
+	RegisterHookChain(RG_CBasePlayer_PostThink, "rg_player_postthink", true)
+	RegisterHookChain(RG_CBasePlayer_ImpulseCommands, "rg_player_impulse")
+	RegisterHookChain(RG_CBasePlayer_AddPlayerItem, "rg_player_additem")
+	RegisterHookChain(RG_CBasePlayer_GiveDefaultItems, "rg_player_givedefaultitems")
+	RegisterHookChain(RG_CBasePlayer_ResetMaxSpeed, "rg_player_resetmaxspeed", true)
+	RegisterHookChain(RG_CBasePlayer_SetClientUserInfoModel, "rg_player_setmodel")
+	RegisterHookChain(RG_CBasePlayerWeapon_DefaultDeploy, "rg_weapon_defaultdeploy")
+
+	// Game rules
+	RegisterHookChain(RG_CSGameRules_RestartRound, "rg_round_restart_post", true)
+	RegisterHookChain(RG_CSGameRules_OnRoundFreezeEnd, "rg_round_freezeend_post", true)
+	RegisterHookChain(RG_RoundEnd, "rg_round_end_post", true)
+	RegisterHookChain(RG_CSGameRules_GetPlayerSpawnSpot, "rg_spawnspot_post", true)
+
+	// World entities (not covered by ReAPI)
 	RegisterHam(Ham_TraceAttack, "func_pushable", "bacon_traceattack_pushable")
 	RegisterHam(Ham_Use, "func_tank", "bacon_use_tank")
 	RegisterHam(Ham_Use, "func_tankmortar", "bacon_use_tank")
@@ -452,17 +403,12 @@ public plugin_init()
 	RegisterHam(Ham_Use, "func_tanklaser", "bacon_use_tank")
 	RegisterHam(Ham_Use, "func_pushable", "bacon_use_pushable")
 	RegisterHam(Ham_Touch, "func_pushable", "bacon_touch_pushable")
-	RegisterHam(Ham_Touch, "weaponbox", "bacon_touch_weapon")
-	RegisterHam(Ham_Touch, "armoury_entity", "bacon_touch_weapon")
-	RegisterHam(Ham_Touch, "weapon_shield", "bacon_touch_weapon")
 	RegisterHam(Ham_Touch, "grenade", "bacon_touch_grenade")
 
 	g_msg_flashlight = get_user_msgid("Flashlight")
-	g_msg_teaminfo = get_user_msgid("TeamInfo")
 	g_msg_scoreattrib = get_user_msgid("ScoreAttrib")
 	g_msg_scoreinfo = get_user_msgid("ScoreInfo")
 	g_msg_deathmsg = get_user_msgid("DeathMsg")
-	g_msg_money = get_user_msgid("Money")
 	g_msg_screenfade = get_user_msgid("ScreenFade")
 
 	register_message(get_user_msgid("Health"), "msg_health")
@@ -472,19 +418,13 @@ public plugin_init()
 	register_message(g_msg_scoreattrib, "msg_scoreattrib")
 	register_message(g_msg_deathmsg, "msg_deathmsg")
 	register_message(g_msg_screenfade, "msg_screenfade")
-	register_message(g_msg_teaminfo, "msg_teaminfo")
-	register_message(get_user_msgid("ClCorpse"), "msg_clcorpse")
+	register_message(get_user_msgid("TeamInfo"), "msg_teaminfo")
 	register_message(get_user_msgid("WeapPickup"), "msg_weaponpickup")
 	register_message(get_user_msgid("AmmoPickup"), "msg_ammopickup")
 
 	register_event("TextMsg", "event_textmsg", "a", "2=#Game_will_restart_in")
-	register_event("HLTV", "event_newround", "a", "1=0", "2=0")
 	register_event("CurWeapon", "event_curweapon", "be", "1=1")
 	register_event("ArmorType", "event_armortype", "be")
-	register_event("Damage", "event_damage", "be")
-
-	register_logevent("logevent_round_start", 2, "1=Round_Start")
-	register_logevent("logevent_round_end", 2, "1=Round_End")
 
 	g_fwd_infect = CreateMultiForward("event_infect", ET_IGNORE, FP_CELL, FP_CELL)
 	g_fwd_gamestart = CreateMultiForward("event_gamestart", ET_IGNORE)
@@ -536,7 +476,7 @@ public plugin_natives()
 	register_native("get_user_class", "native_get_user_class", 1)
 }
 
-// Resolve weapon ids once, equipweapon() no longer does string lookups
+// Resolve weapon ids once, equip code never does string lookups
 cache_weapon_ids()
 {
 	new i
@@ -554,11 +494,9 @@ public client_connect(id)
 {
 	g_showmenu[id] = true
 	g_welcomemsg[id] = true
-	g_blockmodel[id] = true
 	g_zombie[id] = false
 	g_preinfect[id] = false
 	g_disconnected[id] = false
-	g_falling[id] = false
 	g_menufailsafe[id] = false
 	g_suicide[id] = false
 	g_victim[id] = 0
@@ -567,9 +505,6 @@ public client_connect(id)
 	g_player_weapons[id][0] = -1
 	g_player_weapons[id][1] = -1
 	g_regendelay[id] = 0.0
-	g_hitdelay[id] = 0.0
-
-	remove_user_model(id)
 }
 
 public client_putinserver(id)
@@ -580,14 +515,12 @@ public client_putinserver(id)
 
 public client_disconnect(id)
 {
-	remove_task(TASKID_STRIPNGIVE + id)
 	remove_task(TASKID_UPDATESCR + id)
 	remove_task(TASKID_SPAWNDELAY + id)
 	remove_task(TASKID_WEAPONSMENU + id)
 	remove_task(TASKID_CHECKSPAWN + id)
 
 	g_disconnected[id] = true
-	remove_user_model(id)
 }
 
 public cmd_jointeam(id)
@@ -658,6 +591,10 @@ public cmd_infectuser(id, level, cid)
 	return PLUGIN_HANDLED_MAIN
 }
 
+/* ------------------------------------------------------------------ */
+/* Messages                                                            */
+/* ------------------------------------------------------------------ */
+
 public msg_teaminfo(msgid, dest, id)
 {
 	if(!g_gamestarted)
@@ -670,14 +607,14 @@ public msg_teaminfo(msgid, dest, id)
 		return PLUGIN_CONTINUE
 
 	id = get_msg_arg_int(1)
-	if(!g_disconnected[id] || is_user_alive(id))
+	if(!is_valid_player(id) || !g_disconnected[id] || is_user_alive(id))
 		return PLUGIN_CONTINUE
 
 	g_disconnected[id] = false
 	id = randomly_pick_zombie()
 	if(id)
 	{
-		fm_set_user_team(id, g_zombie[id] ? CS_TEAM_CT : CS_TEAM_T, 0)
+		rg_set_user_team(id, g_zombie[id] ? TEAM_CT : TEAM_TERRORIST, MODEL_UNASSIGNED, false)
 		set_pev(id, pev_deadflag, DEAD_RESPAWNABLE)
 	}
 	return PLUGIN_CONTINUE
@@ -773,27 +710,28 @@ public msg_textmsg(msgid, dest, id)
 	return PLUGIN_CONTINUE
 }
 
-public msg_clcorpse(msgid, dest, id)
+/* ------------------------------------------------------------------ */
+/* Round flow (ReGameDLL game rules)                                   */
+/* ------------------------------------------------------------------ */
+
+// New round (replaces the HLTV event)
+public rg_round_restart_post()
 {
-	id = get_msg_arg_int(12)
-	if(!is_valid_player(id) || !g_zombie[id])
-		return PLUGIN_CONTINUE
+	g_gamestarted = false
 
-	// Use the cached model entity instead of searching all entities
-	static ent
-	ent = g_modelent[id]
+	if(cvar_buytime)
+		g_buytime = cvar_buytime + get_gametime()
 
-	if(pev_valid(ent))
-	{
-		static model[64]
-		pev(ent, pev_model, model, charsmax(model))
+	remove_task(TASKID_NEWROUND)
+	remove_task(TASKID_INITROUND)
+	remove_task(TASKID_STARTROUND)
 
-		set_msg_arg_string(1, model)
-	}
-	return PLUGIN_CONTINUE
+	set_task(0.1, "task_newround", TASKID_NEWROUND)
+	set_task(cvar_starttime, "task_initround", TASKID_INITROUND)
 }
 
-public logevent_round_start()
+// Freeze time is over (replaces the Round_Start log event)
+public rg_round_freezeend_post()
 {
 	g_roundended = false
 	g_roundstarted = true
@@ -807,8 +745,8 @@ public logevent_round_start()
 		if(!is_user_alive(id))
 			continue
 
-		team = fm_get_user_team(id)
-		if(team != CS_TEAM_T && team != CS_TEAM_CT)
+		team = get_member(id, m_iTeam)
+		if(!is_playing_team(team))
 			continue
 
 		if(is_user_bot(id))
@@ -825,7 +763,8 @@ public logevent_round_start()
 	}
 }
 
-public logevent_round_end()
+// Round finished (replaces the Round_End log event)
+public rg_round_end_post(WinStatus:status, ScenarioEventEndRound:event, Float:delay)
 {
 	g_gamestarted = false
 	g_roundstarted = false
@@ -851,40 +790,72 @@ public event_textmsg()
 	set_task(float(str_to_num(seconds)) - 0.5, "task_balanceteam", TASKID_BALANCETEAM)
 }
 
-public event_newround()
+// Random spawn points; replaces the per-player teleport loop in task_newround
+public rg_spawnspot_post(const id)
 {
-	g_gamestarted = false
+	if(!cvar_randomspawn || g_spawncount <= 0 || !is_user_alive(id))
+		return HC_CONTINUE
 
-	if(cvar_buytime)
-		g_buytime = cvar_buytime + get_gametime()
+	static team
+	team = get_member(id, m_iTeam)
+	if(!is_playing_team(team))
+		return HC_CONTINUE
 
-	static id
-	for(id = 1; id <= g_maxplayers; id++)
-		g_blockmodel[id] = true
+	static spawn_index, j, Float:spawndata[3]
+	spawn_index = _random(g_spawncount)
 
-	remove_task(TASKID_NEWROUND)
-	remove_task(TASKID_INITROUND)
-	remove_task(TASKID_STARTROUND)
+	copy_spawn_vec(spawndata, spawn_index, 0)
 
-	set_task(0.1, "task_newround", TASKID_NEWROUND)
-	set_task(cvar_starttime, "task_initround", TASKID_INITROUND)
+	if(!fm_is_hull_vacant(spawndata, HULL_HUMAN))
+	{
+		for(j = spawn_index + 1; j != spawn_index; j++)
+		{
+			if(j >= g_spawncount)
+				j = 0
+
+			copy_spawn_vec(spawndata, j, 0)
+
+			if(fm_is_hull_vacant(spawndata, HULL_HUMAN))
+			{
+				spawn_index = j
+				break
+			}
+		}
+	}
+
+	copy_spawn_vec(spawndata, spawn_index, 0)
+	engfunc(EngFunc_SetOrigin, id, spawndata)
+
+	copy_spawn_vec(spawndata, spawn_index, 3)
+	set_pev(id, pev_angles, spawndata)
+
+	copy_spawn_vec(spawndata, spawn_index, 6)
+	set_pev(id, pev_v_angle, spawndata)
+
+	set_pev(id, pev_fixangle, 1)
+	return HC_CONTINUE
 }
+
+// Copies 3 consecutive floats of a spawn entry into a vector
+copy_spawn_vec(Float:vec[3], index, start)
+{
+	vec[0] = g_spawns[index][start]
+	vec[1] = g_spawns[index][start + 1]
+	vec[2] = g_spawns[index][start + 2]
+}
+
+/* ------------------------------------------------------------------ */
+/* Player hookchains                                                   */
+/* ------------------------------------------------------------------ */
 
 public event_curweapon(id)
 {
-	if(!is_user_alive(id))
+	// Zombies hold the knife only (pickups are blocked), nothing to do for them
+	if(g_zombie[id] || !is_user_alive(id))
 		return PLUGIN_CONTINUE
 
 	static weapon
 	weapon = read_data(2)
-
-	if(g_zombie[id])
-	{
-		if(weapon != CSW_KNIFE && !task_exists(TASKID_STRIPNGIVE + id))
-			set_task(0.1, "task_stripngive", TASKID_STRIPNGIVE + id)
-
-		return PLUGIN_CONTINUE
-	}
 
 	if(!cvar_ammo || (AMMOWP_NULL & (1<<weapon)))
 		return PLUGIN_CONTINUE
@@ -896,8 +867,8 @@ public event_curweapon(id)
 			static maxammo
 			maxammo = g_weapon_ammo[weapon][MAX_AMMO]
 
-			if(maxammo > 0 && fm_get_user_bpammo(id, weapon) < 1)
-				fm_set_user_bpammo(id, weapon, maxammo)
+			if(maxammo > 0 && rg_get_user_bpammo(id, WeaponIdType:weapon) < 1)
+				rg_set_user_bpammo(id, WeaponIdType:weapon, maxammo)
 		}
 		case 2:
 		{
@@ -905,7 +876,7 @@ public event_curweapon(id)
 			maxclip = g_weapon_ammo[weapon][MAX_CLIP]
 
 			if(maxclip > 0 && read_data(3) < 1)
-				fill_clip(id, weapon, maxclip)
+				fill_active_clip(id, maxclip)
 		}
 	}
 	return PLUGIN_CONTINUE
@@ -913,159 +884,344 @@ public event_curweapon(id)
 
 public event_armortype(id)
 {
-	if(g_zombie[id] && is_user_alive(id) && fm_get_user_armortype(id) != CS_ARMOR_NONE)
-		fm_set_user_armortype(id, CS_ARMOR_NONE)
+	if(g_zombie[id] && is_user_alive(id) && get_member(id, m_iKevlar) != ARMOR_NONE)
+		rg_set_user_armor(id, 0, ARMOR_NONE)
 
 	return PLUGIN_CONTINUE
 }
 
-public event_damage(victim)
+public rg_player_prethink(const id)
 {
-	if(!g_gamestarted || !is_user_alive(victim))
-		return PLUGIN_CONTINUE
+	// Zombie health regeneration; humans leave on the first flag test
+	if(!g_zombie[id] || !g_gamestarted)
+		return HC_CONTINUE
 
-	if(g_zombie[victim])
+	static pclass, Float:health
+	pclass = g_player_class[id]
+	pev(id, pev_health, health)
+
+	if(health < g_class_data[pclass][DATA_HEALTH] && is_user_alive(id))
 	{
-		static Float:gametime, pclass
+		static Float:gametime
 		gametime = get_gametime()
-		pclass = g_player_class[victim]
 
-		g_regendelay[victim] = gametime + g_class_data[pclass][DATA_HITREGENDLY]
-		g_hitdelay[victim] = gametime + g_class_data[pclass][DATA_HITDELAY]
-	}
-	else
-	{
-		static attacker
-		attacker = get_user_attacker(victim)
-
-		if(g_infecting || !g_zombie[attacker] || !is_user_alive(attacker))
-			return PLUGIN_CONTINUE
-
-		if(g_victim[attacker] == victim)
+		if(g_regendelay[id] < gametime)
 		{
-			g_infecting = true
-			g_victim[attacker] = 0
-
-			message_begin(MSG_ALL, g_msg_deathmsg)
-			write_byte(attacker)
-			write_byte(victim)
-			write_byte(0)
-			write_string(g_infection_name)
-			message_end()
-
-			message_begin(MSG_ALL, g_msg_scoreattrib)
-			write_byte(victim)
-			write_byte(0)
-			message_end()
-
-			infect_user(victim, attacker)
-
-			static Float:frags
-			pev(attacker, pev_frags, frags)
-
-			set_pev(attacker, pev_frags, frags + 1.0)
-			fm_set_user_deaths(victim, fm_get_user_deaths(victim) + 1)
-
-			fm_set_user_money(attacker, cvar_infectmoney)
-
-			static params[2]
-			params[0] = attacker
-			params[1] = victim
-
-			set_task(0.3, "task_updatescore", TASKID_UPDATESCR, params, 2)
-		}
-		g_infecting = false
-	}
-	return PLUGIN_CONTINUE
-}
-
-public fwd_player_prethink(id)
-{
-	// Cheap flag first: humans (the majority) leave immediately
-	if(!g_zombie[id] || !is_user_alive(id))
-		return FMRES_IGNORED
-
-	static flags
-	flags = pev(id, pev_flags)
-
-	if(flags & FL_ONGROUND)
-	{
-		if(cvar_painshockfree)
-		{
-			pev(id, pev_velocity, g_vecvel)
-			g_brestorevel = true
+			set_pev(id, pev_health, health + 1.0)
+			g_regendelay[id] = gametime + g_class_data[pclass][DATA_REGENDLY]
 		}
 	}
-	else
-	{
-		static Float:fallvelocity
-		pev(id, pev_flFallVelocity, fallvelocity)
-
-		g_falling[id] = (fallvelocity >= 350.0)
-	}
-
-	if(g_gamestarted)
-	{
-		static pclass, Float:health
-		pclass = g_player_class[id]
-		pev(id, pev_health, health)
-
-		if(health < g_class_data[pclass][DATA_HEALTH])
-		{
-			static Float:gametime
-			gametime = get_gametime()
-
-			if(g_regendelay[id] < gametime)
-			{
-				set_pev(id, pev_health, health + 1.0)
-				g_regendelay[id] = gametime + g_class_data[pclass][DATA_REGENDLY]
-			}
-		}
-	}
-	return FMRES_IGNORED
+	return HC_CONTINUE
 }
 
-public fwd_player_prethink_post(id)
+// Keeps the buy zone "touched" while the buy time is running
+public rg_player_postthink(const id)
 {
-	if(!g_brestorevel)
-		return FMRES_IGNORED
-
-	g_brestorevel = false
-
-	static flag
-	flag = pev(id, pev_flags)
-
-	if(flag & FL_ONTRAIN)
-		return FMRES_IGNORED
-
-	if((flag & FL_CONVEYOR) && pev_valid(pev(id, pev_groundentity)))
-	{
-		static Float:vectemp[3]
-		pev(id, pev_basevelocity, vectemp)
-
-		xs_vec_add(g_vecvel, vectemp, g_vecvel)
-	}
-
-	if(!(flag & FL_DUCKING) && g_hitdelay[id] > get_gametime())
-		xs_vec_mul_scalar(g_vecvel, g_class_data[g_player_class[id]][DATA_HITSPEED], g_vecvel)
-
-	set_pev(id, pev_velocity, g_vecvel)
-	return FMRES_HANDLED
-}
-
-public fwd_player_postthink(id)
-{
-	if(g_zombie[id] && g_falling[id] && is_user_alive(id) && (pev(id, pev_flags) & FL_ONGROUND))
-	{
-		set_pev(id, pev_watertype, CONTENTS_WATER)
-		g_falling[id] = false
-	}
-
 	if(cvar_buytime && g_buytime > get_gametime() && is_user_alive(id) && pev_valid(g_buyzone))
 		dllfunc(DLLFunc_Touch, g_buyzone, id)
 
-	return FMRES_IGNORED
+	return HC_CONTINUE
 }
+
+// Flashlight is disabled for zombies
+public rg_player_impulse(const id)
+{
+	if(g_zombie[id] && pev(id, pev_impulse) == 100 && is_user_alive(id))
+		set_pev(id, pev_impulse, 0)
+
+	return HC_CONTINUE
+}
+
+// Zombies cannot pick up or buy any weapon
+public rg_player_additem(const id, const item)
+{
+	if(!g_zombie[id] || g_allow_item)
+		return HC_CONTINUE
+
+	SetHookChainReturn(ATYPE_INTEGER, 0)
+	return HC_SUPERCEDE
+}
+
+// Zombies spawn with the knife only
+public rg_player_givedefaultitems(const id)
+{
+	if(!g_zombie[id])
+		return HC_CONTINUE
+
+	give_zombie_knife(id)
+	return HC_SUPERCEDE
+}
+
+public rg_player_resetmaxspeed(const id)
+{
+	if(g_zombie[id] && is_user_alive(id))
+		set_pev(id, pev_maxspeed, g_class_data[g_player_class[id]][DATA_SPEED])
+
+	return HC_CONTINUE
+}
+
+// The engine must not overwrite the zombie model with the team model
+public rg_player_setmodel(const id, infobuffer[], szNewModel[])
+{
+	if(g_zombie[id] && !g_setting_model)
+		return HC_SUPERCEDE
+
+	return HC_CONTINUE
+}
+
+// Zombie claws use the class view model
+public rg_weapon_defaultdeploy(const weapon, szViewModel[], szWeaponModel[], iAnim, szAnimExt[], skiplocal)
+{
+	static id
+	id = get_member(weapon, m_pPlayer)
+
+	if(!is_valid_player(id) || !g_zombie[id])
+		return HC_CONTINUE
+
+	SetHookChainArg(2, ATYPE_STRING, g_class_wmodel[g_player_class[id]])
+	SetHookChainArg(3, ATYPE_STRING, "")
+	return HC_CONTINUE
+}
+
+public rg_player_traceattack(const victim, attacker, Float:damage, Float:direction[3], tracehandle, damagetype)
+{
+	if(!g_gamestarted)
+		return HC_SUPERCEDE
+
+	if(!cvar_knockback || !(damagetype & DMG_BULLET) || !g_zombie[victim] || !is_valid_player(attacker))
+		return HC_CONTINUE
+
+	static kbpower
+	kbpower = g_weapon_knockback[get_user_weapon(attacker)]
+
+	if(kbpower == -1)
+		return HC_CONTINUE
+
+	static flags
+	flags = pev(victim, pev_flags)
+
+	if(cvar_knockback_duck && (flags & FL_DUCKING) && (flags & FL_ONGROUND))
+		return HC_CONTINUE
+
+	static Float:origins[2][3]
+	pev(victim, pev_origin, origins[0])
+	pev(attacker, pev_origin, origins[1])
+
+	if(get_distance_f(origins[0], origins[1]) > cvar_knockback_dist)
+		return HC_CONTINUE
+
+	static Float:velocity[3], Float:push[3], Float:zvel
+	pev(victim, pev_velocity, velocity)
+	zvel = velocity[2]
+
+	xs_vec_mul_scalar(direction, damage * g_class_data[g_player_class[victim]][DATA_KNOCKBACK] * g_knockbackpower[kbpower], push)
+	xs_vec_add(push, velocity, velocity)
+	velocity[2] = zvel
+
+	set_pev(victim, pev_velocity, velocity)
+	return HC_CONTINUE
+}
+
+public rg_player_takedamage(const victim, inflictor, attacker, Float:damage, damagetype)
+{
+	// Zombies are immune to fall damage
+	if((damagetype & DMG_FALL) && g_zombie[victim])
+	{
+		SetHookChainReturn(ATYPE_INTEGER, 0)
+		return HC_SUPERCEDE
+	}
+
+	if(damagetype & DMG_GENERIC || victim == attacker || !is_valid_player(attacker) || !is_user_alive(victim) || !is_user_connected(attacker))
+		return HC_CONTINUE
+
+	if(!g_gamestarted || (!g_zombie[victim] && !g_zombie[attacker]) || ((damagetype & DMG_HEGRENADE) && g_zombie[attacker]))
+	{
+		SetHookChainReturn(ATYPE_INTEGER, 0)
+		return HC_SUPERCEDE
+	}
+
+	if(!g_zombie[attacker])
+	{
+		static pclass
+		pclass = g_player_class[victim]
+
+		damage *= (damagetype & DMG_HEGRENADE) ? g_class_data[pclass][DATA_HEDEFENCE] : g_class_data[pclass][DATA_DEFENCE]
+		SetHookChainArg(4, ATYPE_FLOAT, damage)
+	}
+	else
+	{
+		if(get_user_weapon(attacker) != CSW_KNIFE)
+		{
+			SetHookChainReturn(ATYPE_INTEGER, 0)
+			return HC_SUPERCEDE
+		}
+
+		damage *= g_class_data[g_player_class[attacker]][DATA_ATTACK]
+
+		static Float:armor
+		pev(victim, pev_armorvalue, armor)
+
+		if(cvar_obeyarmor && armor > 0.0)
+		{
+			armor -= damage
+
+			if(armor < 0.0)
+				armor = 0.0
+
+			set_pev(victim, pev_armorvalue, armor)
+			SetHookChainArg(4, ATYPE_FLOAT, 0.0)
+		}
+		else
+		{
+			static bool:infect
+			infect = allow_infection()
+
+			g_victim[attacker] = infect ? victim : 0
+
+			SetHookChainArg(4, ATYPE_FLOAT, (g_infecting || infect) ? 0.0 : damage)
+		}
+	}
+	return HC_CONTINUE
+}
+
+// Replaces the Damage event: zombie pain handling and the actual infection
+public rg_player_takedamage_post(const victim, inflictor, attacker, Float:damage, damagetype)
+{
+	if(!g_gamestarted || !is_user_alive(victim))
+		return HC_CONTINUE
+
+	if(g_zombie[victim])
+	{
+		static pclass
+		pclass = g_player_class[victim]
+
+		g_regendelay[victim] = get_gametime() + g_class_data[pclass][DATA_HITREGENDLY]
+
+		// Pain shock: ducking zombies are not slowed, others only by DATA_HITSPEED
+		if(cvar_painshockfree)
+			set_member(victim, m_flVelocityModifier, (pev(victim, pev_flags) & FL_DUCKING) ? 1.0 : g_class_data[pclass][DATA_HITSPEED])
+
+		return HC_CONTINUE
+	}
+
+	if(g_infecting || !is_valid_player(attacker) || !g_zombie[attacker] || g_victim[attacker] != victim || !is_user_alive(attacker))
+		return HC_CONTINUE
+
+	g_infecting = true
+	g_victim[attacker] = 0
+
+	message_begin(MSG_ALL, g_msg_deathmsg)
+	write_byte(attacker)
+	write_byte(victim)
+	write_byte(0)
+	write_string(g_infection_name)
+	message_end()
+
+	message_begin(MSG_ALL, g_msg_scoreattrib)
+	write_byte(victim)
+	write_byte(0)
+	message_end()
+
+	infect_user(victim, attacker)
+
+	static Float:frags
+	pev(attacker, pev_frags, frags)
+
+	set_pev(attacker, pev_frags, frags + 1.0)
+	set_member(victim, m_iDeaths, get_member(victim, m_iDeaths) + 1)
+
+	rg_add_account(attacker, cvar_infectmoney, AS_ADD)
+
+	static params[2]
+	params[0] = attacker
+	params[1] = victim
+
+	set_task(0.3, "task_updatescore", TASKID_UPDATESCR, params, 2)
+
+	g_infecting = false
+	return HC_CONTINUE
+}
+
+public rg_player_killed(const victim, killer, shouldgib)
+{
+	if(!g_zombie[victim] || !is_valid_player(killer) || g_zombie[killer] || !is_user_alive(killer))
+		return HC_CONTINUE
+
+	if(cvar_killbonus)
+	{
+		static Float:frags
+		pev(killer, pev_frags, frags)
+		set_pev(killer, pev_frags, frags + float(cvar_killbonus))
+	}
+
+	switch(cvar_killreward)
+	{
+		case 1: reward_clip(killer)
+		case 2: reward_grenade(killer)
+		case 3:
+		{
+			reward_clip(killer)
+			reward_grenade(killer)
+		}
+	}
+	return HC_CONTINUE
+}
+
+reward_clip(id)
+{
+	static maxclip
+	maxclip = g_weapon_ammo[get_user_weapon(id)][MAX_CLIP]
+
+	if(maxclip > 0)
+		fill_active_clip(id, maxclip)
+}
+
+reward_grenade(id)
+{
+	if(!rg_has_item_by_name(id, "weapon_hegrenade"))
+		rg_give_item(id, "weapon_hegrenade")
+}
+
+// The active item is the weapon that fired, no entity search needed
+fill_active_clip(id, amount)
+{
+	static ent
+	ent = get_member(id, m_pActiveItem)
+
+	if(ent > 0 && pev_valid(ent))
+		set_member(ent, m_Weapon_iClip, amount)
+}
+
+public rg_player_spawn_post(const id)
+{
+	if(!is_user_alive(id))
+		return HC_CONTINUE
+
+	static team
+	team = get_member(id, m_iTeam)
+
+	if(!is_playing_team(team))
+		return HC_CONTINUE
+
+	if(g_zombie[id])
+	{
+		if(cvar_respawnaszombie && !g_roundended)
+		{
+			set_zombie_attibutes(id)
+			return HC_CONTINUE
+		}
+		cure_user(id)
+	}
+
+	set_task(0.3, "task_spawned", TASKID_SPAWNDELAY + id)
+	set_task(5.0, "task_checkspawn", TASKID_CHECKSPAWN + id)
+
+	return HC_CONTINUE
+}
+
+/* ------------------------------------------------------------------ */
+/* Engine forwards                                                     */
+/* ------------------------------------------------------------------ */
 
 public fwd_emitsound(id, channel, sample[], Float:volume, Float:attn, flag, pitch)
 {
@@ -1098,15 +1254,6 @@ public fwd_emitsound(id, channel, sample[], Float:volume, Float:attn, flag, pitc
 		return FMRES_SUPERCEDE
 	}
 	return FMRES_IGNORED
-}
-
-public fwd_cmdstart(id, handle, seed)
-{
-	if(!g_zombie[id] || get_uc(handle, UC_Impulse) != IMPULSE_FLASHLIGHT || !is_user_alive(id))
-		return FMRES_IGNORED
-
-	set_uc(handle, UC_Impulse, 0)
-	return FMRES_SUPERCEDE
 }
 
 public fwd_spawn(ent)
@@ -1148,68 +1295,15 @@ public fwd_clientkill(id)
 		g_suicide[id] = true
 }
 
-public fwd_setclientkeyvalue(id, infobuffer, const key[])
-{
-	if(!g_blockmodel[id] || !equal(key, "model"))
-		return FMRES_IGNORED
-
-	static model[32]
-	fm_get_user_model(id, model, charsmax(model))
-
-	if(equal(model, "gordon"))
-		return FMRES_IGNORED
-
-	g_blockmodel[id] = false
-	return FMRES_SUPERCEDE
-}
-
-public bacon_touch_weapon(ent, id)
-	return (is_valid_player(id) && g_zombie[id] && is_user_alive(id)) ? HAM_SUPERCEDE : HAM_IGNORED
+/* ------------------------------------------------------------------ */
+/* Ham hooks for world entities                                        */
+/* ------------------------------------------------------------------ */
 
 public bacon_use_tank(ent, caller, activator, use_type, Float:value)
 	return (is_valid_player(caller) && g_zombie[caller] && is_user_alive(caller)) ? HAM_SUPERCEDE : HAM_IGNORED
 
 public bacon_use_pushable(ent, caller, activator, use_type, Float:value)
 	return HAM_SUPERCEDE
-
-public bacon_traceattack_player(victim, attacker, Float:damage, Float:direction[3], tracehandle, damagetype)
-{
-	if(!g_gamestarted)
-		return HAM_SUPERCEDE
-
-	if(!cvar_knockback || !(damagetype & DMG_BULLET) || !g_zombie[victim] || !is_valid_player(attacker))
-		return HAM_IGNORED
-
-	static kbpower
-	kbpower = g_weapon_knockback[get_user_weapon(attacker)]
-
-	if(kbpower == -1)
-		return HAM_IGNORED
-
-	static flags
-	flags = pev(victim, pev_flags)
-
-	if(cvar_knockback_duck && (flags & FL_DUCKING) && (flags & FL_ONGROUND))
-		return HAM_IGNORED
-
-	static Float:origins[2][3]
-	pev(victim, pev_origin, origins[0])
-	pev(attacker, pev_origin, origins[1])
-
-	if(get_distance_f(origins[0], origins[1]) > cvar_knockback_dist)
-		return HAM_IGNORED
-
-	static Float:velocity[3], Float:zvel
-	pev(victim, pev_velocity, velocity)
-	zvel = velocity[2]
-
-	xs_vec_mul_scalar(direction, damage * g_class_data[g_player_class[victim]][DATA_KNOCKBACK] * g_knockbackpower[kbpower], direction)
-	xs_vec_add(direction, velocity, velocity)
-	velocity[2] = zvel
-
-	set_pev(victim, pev_velocity, velocity)
-	return HAM_HANDLED
-}
 
 public bacon_touch_grenade(ent, world)
 {
@@ -1224,135 +1318,6 @@ public bacon_touch_grenade(ent, world)
 		set_pev(ent, pev_dmgtime, 0.0)
 		return HAM_HANDLED
 	}
-	return HAM_IGNORED
-}
-
-public bacon_takedamage_player(victim, inflictor, attacker, Float:damage, damagetype)
-{
-	if(damagetype & DMG_GENERIC || victim == attacker || !is_valid_player(attacker) || !is_user_alive(victim) || !is_user_connected(attacker))
-		return HAM_IGNORED
-
-	if(!g_gamestarted || (!g_zombie[victim] && !g_zombie[attacker]) || ((damagetype & DMG_HEGRENADE) && g_zombie[attacker]))
-		return HAM_SUPERCEDE
-
-	if(!g_zombie[attacker])
-	{
-		static pclass
-		pclass = g_player_class[victim]
-
-		damage *= (damagetype & DMG_HEGRENADE) ? g_class_data[pclass][DATA_HEDEFENCE] : g_class_data[pclass][DATA_DEFENCE]
-		SetHamParamFloat(4, damage)
-	}
-	else
-	{
-		if(get_user_weapon(attacker) != CSW_KNIFE)
-			return HAM_SUPERCEDE
-
-		damage *= g_class_data[g_player_class[attacker]][DATA_ATTACK]
-
-		static Float:armor
-		pev(victim, pev_armorvalue, armor)
-
-		if(cvar_obeyarmor && armor > 0.0)
-		{
-			armor -= damage
-
-			if(armor < 0.0)
-				armor = 0.0
-
-			set_pev(victim, pev_armorvalue, armor)
-			SetHamParamFloat(4, 0.0)
-		}
-		else
-		{
-			static bool:infect
-			infect = allow_infection()
-
-			g_victim[attacker] = infect ? victim : 0
-
-			SetHamParamFloat(4, (g_infecting || infect) ? 0.0 : damage)
-		}
-	}
-	return HAM_HANDLED
-}
-
-public bacon_killed_player(victim, killer, shouldgib)
-{
-	if(!g_zombie[victim] || !is_valid_player(killer) || g_zombie[killer] || !is_user_alive(killer))
-		return HAM_IGNORED
-
-	if(cvar_killbonus)
-	{
-		static Float:frags
-		pev(killer, pev_frags, frags)
-		set_pev(killer, pev_frags, frags + float(cvar_killbonus))
-	}
-
-	switch(cvar_killreward)
-	{
-		case 1: reward_clip(killer)
-		case 2: reward_grenade(killer)
-		case 3:
-		{
-			reward_clip(killer)
-			reward_grenade(killer)
-		}
-	}
-	return HAM_IGNORED
-}
-
-reward_clip(id)
-{
-	static weapon, maxclip
-	weapon = get_user_weapon(id)
-	maxclip = g_weapon_ammo[weapon][MAX_CLIP]
-
-	if(maxclip > 0)
-		fill_clip(id, weapon, maxclip)
-}
-
-reward_grenade(id)
-{
-	if(!user_has_weapon(id, CSW_HEGRENADE))
-		bacon_give_weapon(id, "weapon_hegrenade")
-}
-
-fill_clip(id, weapon, amount)
-{
-	static weaponname[32], ent
-	get_weaponname(weapon, weaponname, charsmax(weaponname))
-
-	ent = fm_find_ent_by_owner(-1, weaponname, id)
-	if(ent > 0)
-		fm_set_weapon_ammo(ent, amount)
-}
-
-public bacon_spawn_player_post(id)
-{
-	if(!is_user_alive(id))
-		return HAM_IGNORED
-
-	static team
-	team = fm_get_user_team(id)
-
-	if(team != CS_TEAM_T && team != CS_TEAM_CT)
-		return HAM_IGNORED
-
-	if(g_zombie[id])
-	{
-		if(cvar_respawnaszombie && !g_roundended)
-		{
-			set_zombie_attibutes(id)
-			return HAM_IGNORED
-		}
-		cure_user(id)
-	}
-	else if(pev(id, pev_rendermode) == kRenderTransTexture)
-		reset_user_model(id)
-
-	set_task(0.3, "task_spawned", TASKID_SPAWNDELAY + id)
-	set_task(5.0, "task_checkspawn", TASKID_CHECKSPAWN + id)
-
 	return HAM_IGNORED
 }
 
@@ -1406,6 +1371,10 @@ public bacon_traceattack_pushable(ent, attacker, Float:damage, Float:direction[3
 	return HAM_HANDLED
 }
 
+/* ------------------------------------------------------------------ */
+/* Tasks                                                               */
+/* ------------------------------------------------------------------ */
+
 public task_spawned(taskid)
 {
 	static id
@@ -1446,8 +1415,8 @@ public task_spawned(taskid)
 
 	if(!g_gamestarted)
 		client_print(id, print_chat, "%L %L", id, "SCAN_RESULTS", id, g_preinfect[id] ? "SCAN_INFECTED" : "SCAN_CLEAN")
-	else if(fm_get_user_team(id) == CS_TEAM_T)
-		fm_set_user_team(id, CS_TEAM_CT)
+	else if(get_member(id, m_iTeam) == TEAM_TERRORIST)
+		rg_set_user_team(id, TEAM_CT, MODEL_UNASSIGNED)
 }
 
 public task_checkspawn(taskid)
@@ -1458,10 +1427,10 @@ public task_checkspawn(taskid)
 	if(g_roundended || !is_user_connected(id) || is_user_alive(id))
 		return
 
-	team = fm_get_user_team(id)
+	team = get_member(id, m_iTeam)
 
-	if(team == CS_TEAM_T || team == CS_TEAM_CT)
-		ExecuteHamB(Ham_CS_RoundRespawn, id)
+	if(is_playing_team(team))
+		rg_round_respawn(id)
 }
 
 public task_showtruehealth()
@@ -1510,9 +1479,9 @@ send_scoreinfo(id)
 	message_begin(MSG_BROADCAST, g_msg_scoreinfo)
 	write_byte(id)
 	write_short(get_user_frags(id))
-	write_short(fm_get_user_deaths(id))
+	write_short(get_member(id, m_iDeaths))
 	write_short(0)
-	write_short(get_user_team(id))
+	write_short(get_member(id, m_iTeam))
 	message_end()
 }
 
@@ -1525,102 +1494,30 @@ public task_weaponsmenu(taskid)
 		display_equipmenu(id)
 }
 
-public task_stripngive(taskid)
-{
-	static id, pclass
-	id = taskid - TASKID_STRIPNGIVE
-
-	if(!is_user_alive(id))
-		return
-
-	pclass = g_player_class[id]
-
-	fm_strip_user_weapons(id)
-	fm_reset_user_primary(id)
-	bacon_give_weapon(id, "weapon_knife")
-
-	set_pev(id, pev_weaponmodel2, "")
-	set_pev(id, pev_viewmodel2, g_class_wmodel[pclass])
-	set_pev(id, pev_maxspeed, g_class_data[pclass][DATA_SPEED])
-}
-
 public task_newround()
 {
 	static players[32], num, zombies, i, id
 	get_players(players, num, "a")
 
-	if(num > 1)
-	{
-		for(i = 0; i < num; i++)
-			g_preinfect[players[i]] = false
-
-		// Upper bound is the player count, otherwise the picking loop never ends
-		zombies = clamp(floatround(num * cvar_zombiemulti), 1, min(31, num))
-
-		i = 0
-		while(i < zombies)
-		{
-			id = players[_random(num)]
-			if(!g_preinfect[id])
-			{
-				g_preinfect[id] = true
-				i++
-			}
-		}
-	}
-
-	if(!cvar_randomspawn || g_spawncount <= 0)
+	if(num < 2)
 		return
 
-	static team, spawn_index, j, Float:spawndata[3]
 	for(i = 0; i < num; i++)
+		g_preinfect[players[i]] = false
+
+	// Upper bound is the player count, otherwise the picking loop never ends
+	zombies = clamp(floatround(num * cvar_zombiemulti), 1, min(31, num))
+
+	i = 0
+	while(i < zombies)
 	{
-		id = players[i]
-
-		team = fm_get_user_team(id)
-		if((team != CS_TEAM_T && team != CS_TEAM_CT) || pev(id, pev_iuser1))
-			continue
-
-		spawn_index = _random(g_spawncount)
-
-		xs_vec_copy_spawn(spawndata, spawn_index, 0)
-
-		if(!fm_is_hull_vacant(spawndata, HULL_HUMAN))
+		id = players[_random(num)]
+		if(!g_preinfect[id])
 		{
-			for(j = spawn_index + 1; j != spawn_index; j++)
-			{
-				if(j >= g_spawncount)
-					j = 0
-
-				xs_vec_copy_spawn(spawndata, j, 0)
-
-				if(fm_is_hull_vacant(spawndata, HULL_HUMAN))
-				{
-					spawn_index = j
-					break
-				}
-			}
+			g_preinfect[id] = true
+			i++
 		}
-
-		xs_vec_copy_spawn(spawndata, spawn_index, 0)
-		engfunc(EngFunc_SetOrigin, id, spawndata)
-
-		xs_vec_copy_spawn(spawndata, spawn_index, 3)
-		set_pev(id, pev_angles, spawndata)
-
-		xs_vec_copy_spawn(spawndata, spawn_index, 6)
-		set_pev(id, pev_v_angle, spawndata)
-
-		set_pev(id, pev_fixangle, 1)
 	}
-}
-
-// Copies 3 consecutive floats of a spawn entry into a vector
-stock xs_vec_copy_spawn(Float:vec[3], index, start)
-{
-	vec[0] = g_spawns[index][start]
-	vec[1] = g_spawns[index][start + 1]
-	vec[2] = g_spawns[index][start + 2]
 }
 
 public task_initround()
@@ -1654,10 +1551,7 @@ public task_initround()
 		if(id == newzombie || g_preinfect[id])
 			infect_user(id, 0)
 		else
-		{
-			fm_set_user_team(id, CS_TEAM_CT, 0)
-			add_delay(id, "update_team")
-		}
+			rg_set_user_team(id, TEAM_CT, MODEL_UNASSIGNED)
 	}
 
 	set_hudmessage(_, _, _, _, _, 1)
@@ -1686,37 +1580,37 @@ public task_startround()
 
 public task_balanceteam()
 {
-	static players[3][32], count[3]
-	get_players(players[CS_TEAM_UNASSIGNED], count[CS_TEAM_UNASSIGNED])
+	static players[4][32], count[4], all[32], num
+	count[TEAM_TERRORIST] = 0
+	count[TEAM_CT] = 0
 
-	count[CS_TEAM_T] = 0
-	count[CS_TEAM_CT] = 0
+	get_players(all, num)
 
 	static i, id, team
-	for(i = 0; i < count[CS_TEAM_UNASSIGNED]; i++)
+	for(i = 0; i < num; i++)
 	{
-		id = players[CS_TEAM_UNASSIGNED][i]
-		team = fm_get_user_team(id)
+		id = all[i]
+		team = get_member(id, m_iTeam)
 
-		if(team == CS_TEAM_T || team == CS_TEAM_CT)
+		if(is_playing_team(team))
 			players[team][count[team]++] = id
 	}
 
-	if(abs(count[CS_TEAM_T] - count[CS_TEAM_CT]) <= 1)
+	if(abs(count[TEAM_TERRORIST] - count[TEAM_CT]) <= 1)
 		return
 
 	static maxplayers
-	maxplayers = (count[CS_TEAM_T] + count[CS_TEAM_CT]) / 2
+	maxplayers = (count[TEAM_TERRORIST] + count[TEAM_CT]) / 2
 
-	if(count[CS_TEAM_T] > maxplayers)
+	if(count[TEAM_TERRORIST] > maxplayers)
 	{
-		for(i = 0; i < (count[CS_TEAM_T] - maxplayers); i++)
-			fm_set_user_team(players[CS_TEAM_T][i], CS_TEAM_CT, 0)
+		for(i = 0; i < (count[TEAM_TERRORIST] - maxplayers); i++)
+			rg_set_user_team(players[TEAM_TERRORIST][i], TEAM_CT, MODEL_UNASSIGNED, false)
 	}
 	else
 	{
-		for(i = 0; i < (count[CS_TEAM_CT] - maxplayers); i++)
-			fm_set_user_team(players[CS_TEAM_CT][i], CS_TEAM_T, 0)
+		for(i = 0; i < (count[TEAM_CT] - maxplayers); i++)
+			rg_set_user_team(players[TEAM_CT][i], TEAM_TERRORIST, MODEL_UNASSIGNED, false)
 	}
 }
 
@@ -1728,22 +1622,9 @@ bot_weapons(id)
 	equipweapon(id, EQUIP_ALL)
 }
 
-public update_team(id)
-{
-	if(!is_user_connected(id))
-		return
-
-	static team
-	team = fm_get_user_team(id)
-
-	if(team == CS_TEAM_T || team == CS_TEAM_CT)
-	{
-		emessage_begin(MSG_ALL, g_msg_teaminfo)
-		ewrite_byte(id)
-		ewrite_string(g_teaminfo[team])
-		emessage_end()
-	}
-}
+/* ------------------------------------------------------------------ */
+/* Infection / cure                                                    */
+/* ------------------------------------------------------------------ */
 
 infect_user(victim, attacker)
 {
@@ -1769,7 +1650,7 @@ infect_user(victim, attacker)
 		ShowSyncHudMsg(victim, g_sync_msgdisplay, "%L", victim, "MUTATION_HUD", g_class_name[g_player_class[victim]])
 	}
 
-	fm_set_user_team(victim, CS_TEAM_T)
+	rg_set_user_team(victim, TEAM_TERRORIST, MODEL_UNASSIGNED)
 	set_zombie_attibutes(victim)
 
 	emit_sound(victim, CHAN_STATIC, g_scream_sounds[_random(sizeof g_scream_sounds)], VOL_NORM, ATTN_NONE, 0, PITCH_NORM)
@@ -1781,25 +1662,102 @@ cure_user(id)
 	if(!is_user_alive(id))
 		return
 
-	g_zombie[id] = false
-	g_falling[id] = false
+	static bool:was_zombie
+	was_zombie = g_zombie[id]
 
-	reset_user_model(id)
-	fm_set_user_nvg(id, 0)
+	g_zombie[id] = false
+
+	rg_reset_user_model(id, true)
+	set_member(id, m_bHasNightVision, false)
 	set_pev(id, pev_gravity, 1.0)
 
-	static viewmodel[64]
-	pev(id, pev_viewmodel2, viewmodel, charsmax(viewmodel))
-
-	if(equal(viewmodel, g_class_wmodel[g_player_class[id]]))
+	if(was_zombie)
 	{
-		static weapon
-		weapon = fm_lastknife(id)
+		// Give the knife back its normal view model
+		static knife
+		knife = get_member(id, m_rgpPlayerItems, KNIFE_SLOT)
 
-		if(pev_valid(weapon))
-			ExecuteHam(Ham_Item_Deploy, weapon)
+		if(knife > 0 && pev_valid(knife))
+			ExecuteHam(Ham_Item_Deploy, knife)
 	}
 }
+
+// Removes every weapon and hands out the claws
+give_zombie_knife(id)
+{
+	rg_remove_all_items(id)
+
+	g_allow_item = true
+	rg_give_item(id, "weapon_knife")
+	g_allow_item = false
+}
+
+set_zombie_attibutes(const index)
+{
+	if(!is_valid_player(index) || !is_user_alive(index))
+		return
+
+	g_zombie[index] = true
+
+	new iClass = g_player_class[index]
+	new Float:flHealth = g_class_data[iClass][DATA_HEALTH]
+
+	if(g_preinfect[index])
+		flHealth *= cvar_zombie_hpmulti
+
+	give_zombie_knife(index)
+
+	set_pev(index, pev_health, flHealth)
+	set_pev(index, pev_gravity, g_class_data[iClass][DATA_GRAVITY])
+	set_pev(index, pev_maxspeed, g_class_data[iClass][DATA_SPEED])
+	set_pev(index, pev_body, 0)
+
+	rg_set_user_armor(index, 0, ARMOR_NONE)
+	set_member(index, m_bHasNightVision, true)
+
+	if(cvar_autonvg)
+		engclient_cmd(index, "nightvision")
+
+	// Player model straight from the class (models/player/<name>/<name>.mdl)
+	new modelname[32]
+	get_model_name(g_class_pmodel[iClass], modelname, charsmax(modelname))
+
+	g_setting_model = true
+	rg_set_user_model(index, modelname, true)
+	g_setting_model = false
+
+	new iEffects = pev(index, pev_effects)
+	if(iEffects & EF_DIMLIGHT)
+	{
+		message_begin(MSG_ONE, g_msg_flashlight, _, index)
+		write_byte(0)
+		write_byte(100)
+		message_end()
+
+		set_pev(index, pev_effects, iEffects & ~EF_DIMLIGHT)
+	}
+}
+
+// "models/player/slum/slum.mdl" -> "slum"
+stock get_model_name(const path[], name[], len)
+{
+	new start, i
+	for(i = 0; path[i]; i++)
+	{
+		if(path[i] == '/' || path[i] == 92) // 92 = backslash
+			start = i + 1
+	}
+
+	copy(name, len, path[start])
+
+	i = contain(name, ".mdl")
+	if(i != -1)
+		name[i] = 0
+}
+
+/* ------------------------------------------------------------------ */
+/* Menus                                                               */
+/* ------------------------------------------------------------------ */
 
 public display_equipmenu(id)
 {
@@ -1980,6 +1938,10 @@ public action_class(id, key)
 	return PLUGIN_HANDLED
 }
 
+/* ------------------------------------------------------------------ */
+/* Config loading                                                      */
+/* ------------------------------------------------------------------ */
+
 register_spawnpoints(const mapname[])
 {
 	new configdir[32], csdmfile[64]
@@ -2105,6 +2067,10 @@ register_class(const classname[])
 	return id
 }
 
+/* ------------------------------------------------------------------ */
+/* Natives                                                             */
+/* ------------------------------------------------------------------ */
+
 public native_register_class(classname[], description[])
 {
 	param_convert(1)
@@ -2175,6 +2141,10 @@ public Float:native_get_class_data(classid, dataid)
 public native_set_class_data(classid, dataid, Float:value)
 	g_class_data[classid][dataid] = value
 
+/* ------------------------------------------------------------------ */
+/* Helpers                                                             */
+/* ------------------------------------------------------------------ */
+
 stock bool:fm_is_hull_vacant(const Float:origin[3], hull)
 {
 	static tr
@@ -2194,169 +2164,6 @@ stock fm_set_kvd(entity, const key[], const value[], const classname[] = "")
 	return dllfunc(DLLFunc_KeyValue, entity, 0)
 }
 
-stock fm_strip_user_weapons(index)
-{
-	static stripent
-	if(!pev_valid(stripent))
-	{
-		stripent = engfunc(EngFunc_CreateNamedEntity, engfunc(EngFunc_AllocString, "player_weaponstrip"))
-		dllfunc(DLLFunc_Spawn, stripent)
-		set_pev(stripent, pev_solid, SOLID_NOT)
-	}
-	dllfunc(DLLFunc_Use, stripent, index)
-
-	return 1
-}
-
-stock fm_set_entity_visibility(index, visible = 1)
-{
-	static effects
-	effects = pev(index, pev_effects)
-
-	set_pev(index, pev_effects, visible ? (effects & ~EF_NODRAW) : (effects | EF_NODRAW))
-}
-
-stock fm_find_ent_by_owner(index, const classname[], owner)
-{
-	static ent
-	ent = index
-
-	while((ent = engfunc(EngFunc_FindEntityByString, ent, "classname", classname)) && pev(ent, pev_owner) != owner) {}
-
-	return ent
-}
-
-stock bacon_give_weapon(index, const weapon[])
-{
-	if(!equal(weapon, "weapon_", 7))
-		return 0
-
-	static ent
-	ent = engfunc(EngFunc_CreateNamedEntity, engfunc(EngFunc_AllocString, weapon))
-
-	if(!pev_valid(ent))
-		return 0
-
-	set_pev(ent, pev_spawnflags, SF_NORESPAWN)
-	dllfunc(DLLFunc_Spawn, ent)
-
-	if(!ExecuteHamB(Ham_AddPlayerItem, index, ent))
-	{
-		if(pev_valid(ent))
-			set_pev(ent, pev_flags, pev(ent, pev_flags) | FL_KILLME)
-
-		return 0
-	}
-	ExecuteHamB(Ham_Item_AttachToPlayer, ent, index)
-
-	return 1
-}
-
-stock bacon_strip_weapon(index, const weapon[])
-{
-	if(!equal(weapon, "weapon_", 7))
-		return 0
-
-	static weaponid, weaponent
-	weaponid = get_weaponid(weapon)
-
-	if(!weaponid)
-		return 0
-
-	weaponent = fm_find_ent_by_owner(-1, weapon, index)
-
-	if(!weaponent)
-		return 0
-
-	if(get_user_weapon(index) == weaponid)
-		ExecuteHamB(Ham_Weapon_RetireWeapon, weaponent)
-
-	if(!ExecuteHamB(Ham_RemovePlayerItem, index, weaponent))
-		return 0
-
-	ExecuteHamB(Ham_Item_Kill, weaponent)
-	set_pev(index, pev_weapons, pev(index, pev_weapons) & ~(1<<weaponid))
-
-	return 1
-}
-
-stock fm_set_user_team(index, team, update = 1)
-{
-	set_pdata_int(index, OFFSET_TEAM, team)
-	if(update)
-	{
-		emessage_begin(MSG_ALL, g_msg_teaminfo)
-		ewrite_byte(index)
-		ewrite_string(g_teaminfo[team])
-		emessage_end()
-	}
-	return 1
-}
-
-// Backpack ammo offset of a weapon, 0 if it has none
-stock fm_get_bpammo_offset(weapon)
-{
-	switch(weapon)
-	{
-		case CSW_AWP: return OFFSET_AMMO_338MAGNUM
-		case CSW_SCOUT, CSW_AK47, CSW_G3SG1: return OFFSET_AMMO_762NATO
-		case CSW_M249: return OFFSET_AMMO_556NATOBOX
-		case CSW_FAMAS, CSW_M4A1, CSW_AUG, CSW_SG550, CSW_GALI, CSW_SG552: return OFFSET_AMMO_556NATO
-		case CSW_M3, CSW_XM1014: return OFFSET_AMMO_BUCKSHOT
-		case CSW_USP, CSW_UMP45, CSW_MAC10: return OFFSET_AMMO_45ACP
-		case CSW_FIVESEVEN, CSW_P90: return OFFSET_AMMO_57MM
-		case CSW_DEAGLE: return OFFSET_AMMO_50AE
-		case CSW_P228: return OFFSET_AMMO_357SIG
-		case CSW_GLOCK18, CSW_TMP, CSW_ELITE, CSW_MP5NAVY: return OFFSET_AMMO_9MM
-	}
-	return 0
-}
-
-stock fm_get_user_bpammo(index, weapon)
-{
-	static offset
-	offset = fm_get_bpammo_offset(weapon)
-
-	return offset ? get_pdata_int(index, offset) : 0
-}
-
-stock fm_set_user_bpammo(index, weapon, amount)
-{
-	static offset
-	offset = fm_get_bpammo_offset(weapon)
-
-	if(offset)
-		set_pdata_int(index, offset, amount)
-
-	return 1
-}
-
-stock fm_set_user_nvg(index, onoff = 1)
-{
-	static nvg
-	nvg = get_pdata_int(index, OFFSET_NVG)
-
-	set_pdata_int(index, OFFSET_NVG, onoff ? (nvg | HAS_NVG) : (nvg & ~HAS_NVG))
-	return 1
-}
-
-stock fm_set_user_money(index, addmoney, update = 1)
-{
-	static money
-	money = fm_get_user_money(index) + addmoney
-
-	set_pdata_int(index, OFFSET_CSMONEY, money)
-
-	if(update)
-	{
-		message_begin(MSG_ONE, g_msg_money, _, index)
-		write_long(clamp(money, 0, 16000))
-		write_byte(1)
-		message_end()
-	}
-	return 1
-}
-
 stock str_count(const str[], searchchar)
 {
 	static i, count
@@ -2368,94 +2175,6 @@ stock str_count(const str[], searchchar)
 			count++
 	}
 	return count
-}
-
-stock reset_user_model(index)
-{
-	set_pev(index, pev_rendermode, kRenderNormal)
-	set_pev(index, pev_renderamt, 0.0)
-
-	if(pev_valid(g_modelent[index]))
-		fm_set_entity_visibility(g_modelent[index], 0)
-}
-
-// Removes the follower model entity that belongs to a player slot
-stock remove_user_model(index)
-{
-	static ent
-	ent = g_modelent[index]
-
-	if(ent && pev_valid(ent))
-		engfunc(EngFunc_RemoveEntity, ent)
-
-	g_modelent[index] = 0
-}
-
-stock set_zombie_attibutes(const index)
-{
-	if(!is_valid_player(index) || !is_user_alive(index))
-		return
-
-	g_zombie[index] = true
-
-	if(!task_exists(TASKID_STRIPNGIVE + index))
-		set_task(0.1, "task_stripngive", TASKID_STRIPNGIVE + index)
-
-	new iClass = g_player_class[index]
-	new Float:flHealth = g_class_data[iClass][DATA_HEALTH]
-
-	if(g_preinfect[index])
-		flHealth *= cvar_zombie_hpmulti
-
-	set_pev(index, pev_health, flHealth)
-	set_pev(index, pev_gravity, g_class_data[iClass][DATA_GRAVITY])
-	set_pev(index, pev_body, 0)
-	set_pev(index, pev_armorvalue, 0.0)
-	set_pev(index, pev_renderamt, 0.0)
-	set_pev(index, pev_rendermode, kRenderTransTexture)
-
-	fm_set_user_armortype(index, CS_ARMOR_NONE)
-	fm_set_user_nvg(index)
-
-	if(cvar_autonvg)
-		engclient_cmd(index, "nightvision")
-
-	new ent = g_modelent[index]
-	if(!pev_valid(ent))
-	{
-		// Cache the string index, AllocString on every infection wastes the string pool
-		static iszInfoTarget
-		if(!iszInfoTarget)
-			iszInfoTarget = engfunc(EngFunc_AllocString, "info_target")
-
-		ent = engfunc(EngFunc_CreateNamedEntity, iszInfoTarget)
-		if(pev_valid(ent))
-		{
-			engfunc(EngFunc_SetModel, ent, g_class_pmodel[iClass])
-			set_pev(ent, pev_classname, MODEL_CLASSNAME)
-			set_pev(ent, pev_movetype, MOVETYPE_FOLLOW)
-			set_pev(ent, pev_aiment, index)
-			set_pev(ent, pev_owner, index)
-
-			g_modelent[index] = ent
-		}
-	}
-	else
-	{
-		engfunc(EngFunc_SetModel, ent, g_class_pmodel[iClass])
-		fm_set_entity_visibility(ent, 1)
-	}
-
-	new iEffects = pev(index, pev_effects)
-	if(iEffects & EF_DIMLIGHT)
-	{
-		message_begin(MSG_ONE, g_msg_flashlight, _, index)
-		write_byte(0)
-		write_byte(100)
-		message_end()
-
-		set_pev(index, pev_effects, iEffects & ~EF_DIMLIGHT)
-	}
 }
 
 // Single pass over the players; stops as soon as the zombie quota is reached
@@ -2500,55 +2219,32 @@ stock randomly_pick_zombie()
 	return (!zcount && hcount) ? humans[_random(hcount)] : 0
 }
 
+// GT_REPLACE swaps whatever sits in the weapon slot, no manual strip needed
 stock equipweapon(id, weapon)
 {
 	if(!is_user_alive(id))
 		return
 
-	static weaponid, current, weaponent, weapname[32]
+	static weaponid
 
 	if(weapon & EQUIP_PRI)
 	{
 		weaponid = g_primary_wid[g_player_weapons[id][0]]
-		weaponent = fm_lastprimary(id)
-		current = -1
 
-		if(pev_valid(weaponent))
-		{
-			current = fm_get_weapon_id(weaponent)
-			if(current != weaponid)
-			{
-				get_weaponname(current, weapname, charsmax(weapname))
-				bacon_strip_weapon(id, weapname)
-			}
-		}
+		if(!rg_has_item_by_name(id, g_primaryweapons[g_player_weapons[id][0]][1]))
+			rg_give_item(id, g_primaryweapons[g_player_weapons[id][0]][1], GT_REPLACE)
 
-		if(current != weaponid)
-			bacon_give_weapon(id, g_primaryweapons[g_player_weapons[id][0]][1])
-
-		fm_set_user_bpammo(id, weaponid, g_weapon_ammo[weaponid][MAX_AMMO])
+		rg_set_user_bpammo(id, WeaponIdType:weaponid, g_weapon_ammo[weaponid][MAX_AMMO])
 	}
 
 	if(weapon & EQUIP_SEC)
 	{
 		weaponid = g_secondary_wid[g_player_weapons[id][1]]
-		weaponent = fm_lastsecondry(id)
-		current = -1
 
-		if(pev_valid(weaponent))
-		{
-			current = fm_get_weapon_id(weaponent)
-			if(current != weaponid)
-			{
-				get_weaponname(current, weapname, charsmax(weapname))
-				bacon_strip_weapon(id, weapname)
-			}
-		}
+		if(!rg_has_item_by_name(id, g_secondaryweapons[g_player_weapons[id][1]][1]))
+			rg_give_item(id, g_secondaryweapons[g_player_weapons[id][1]][1], GT_REPLACE)
 
-		if(current != weaponid)
-			bacon_give_weapon(id, g_secondaryweapons[g_player_weapons[id][1]][1])
-
-		fm_set_user_bpammo(id, weaponid, g_weapon_ammo[weaponid][MAX_AMMO])
+		rg_set_user_bpammo(id, WeaponIdType:weaponid, g_weapon_ammo[weaponid][MAX_AMMO])
 	}
 
 	if(weapon & EQUIP_GREN)
@@ -2556,8 +2252,8 @@ stock equipweapon(id, weapon)
 		static i
 		for(i = 0; i < sizeof g_grenades; i++)
 		{
-			if(!user_has_weapon(id, g_grenade_wid[i]))
-				bacon_give_weapon(id, g_grenades[i])
+			if(!rg_has_item_by_name(id, g_grenades[i]))
+				rg_give_item(id, g_grenades[i])
 		}
 	}
 }
