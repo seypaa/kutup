@@ -243,10 +243,10 @@ new cvar_enabled, cvar_randomspawn, cvar_autonvg, cvar_winsounds, cvar_weaponsme
     Float:cvar_zombiemulti, Float:cvar_zombie_hpmulti, Float:cvar_pushpwr_weapon,
     Float:cvar_pushpwr_zombie, cvar_c4mission, Float:cvar_c4_planttime, Float:cvar_c4_radius,
     cvar_zombie_respawn, Float:cvar_zombie_respawn_time, cvar_mutation_max, cvar_stats,
-    cvar_xp_infect, cvar_xp_kill, cvar_xp_bomb, cvar_maxlevel,
+    cvar_xp_infect, cvar_xp_kill, cvar_xp_bomb, cvar_maxlevel, cvar_class_motd,
     Float:cvar_mutation_health, Float:cvar_mutation_speed, Float:cvar_mutation_attack
 
-new g_vault, g_xp[33], g_level[33], g_stat_infects[33], g_stat_kills[33], g_stat_key[33][40],
+new g_class_motd_count, g_class_motd_path[96], g_vault, g_xp[33], g_level[33], g_stat_infects[33], g_stat_kills[33], g_stat_key[33][40],
     bool:g_stats_loaded[33], g_mutation[33], bool:g_zrespawn[33], bool:g_zombie[33], bool:g_disconnected[33], bool:g_showmenu[33], bool:g_menufailsafe[33],
     bool:g_preinfect[33], bool:g_welcomemsg[33], bool:g_suicide[33], Float:g_regendelay[33],
     g_mutate[33], g_victim[33], g_menuposition[33], g_player_class[33], g_player_weapons[33][2]
@@ -303,6 +303,7 @@ public plugin_precache()
 	bind_int("bh_c4mission", "1", cvar_c4mission)
 	bind_int("bh_zombie_respawn", "1", cvar_zombie_respawn)
 	bind_int("bh_stats", "1", cvar_stats)
+	bind_int("bh_class_motd", "1", cvar_class_motd)
 	bind_int("bh_xp_infect", "5", cvar_xp_infect)
 	bind_int("bh_xp_kill", "10", cvar_xp_kill)
 	bind_int("bh_xp_bomb", "25", cvar_xp_bomb)
@@ -398,6 +399,7 @@ public plugin_init()
 	register_clcmd("say /guns", "cmd_enablemenu")
 	register_clcmd("say /help", "cmd_helpmotd")
 	register_clcmd("say /rank", "cmd_rank")
+	register_clcmd("bh_class", "cmd_setclass")
 	register_clcmd("say /top", "cmd_top")
 	register_clcmd("amx_infect", "cmd_infectuser", ADMIN_BAN, "<name or #userid>")
 
@@ -597,8 +599,89 @@ public client_disconnected(id)
 
 public cmd_classmenu(id)
 {
-	if(g_classcount > 1)
-		display_classmenu(id, g_menuposition[id] = 0)
+	if(g_classcount <= 1)
+		return
+
+	show_class_motd(id)
+	display_classmenu(id, g_menuposition[id] = 0)
+}
+
+// bh_class <number>: picks the class from the MOTD list (a MOTD cannot send clicks back)
+public cmd_setclass(id)
+{
+	if(g_classcount <= 1)
+		return PLUGIN_HANDLED
+
+	static arg[8], number
+	read_argv(1, arg, charsmax(arg))
+	number = str_to_num(arg)
+
+	if(number < 1 || number > g_classcount)
+	{
+		client_print(id, print_console, "Usage: bh_class <1-%d>", g_classcount)
+		return PLUGIN_HANDLED
+	}
+
+	set_next_class(id, number - 1)
+	return PLUGIN_HANDLED
+}
+
+// The class becomes active on the next infection
+set_next_class(id, class)
+{
+	g_mutate[id] = class
+	client_print(id, print_chat, "%L", id, "MENU_CHANGECLASS", g_class_name[class])
+}
+
+/* ------------------------------------------------------------------ */
+/* Class MOTD                                                          */
+/* ------------------------------------------------------------------ */
+
+// Writes the class list as an HTML page; rebuilt when the number of classes changed
+build_class_motd()
+{
+	static datadir[64]
+	get_datadir(datadir, charsmax(datadir))
+	formatex(g_class_motd_path, charsmax(g_class_motd_path), "%s/bh_classes.html", datadir)
+
+	new file = fopen(g_class_motd_path, "wt")
+	if(!file)
+		return
+
+	fputs(file, "<html><head><meta charset=^"utf-8^"><style>body{background:#111;color:#ddd;font-family:Verdana;font-size:12px;margin:8px}")
+	fputs(file, "h3{color:#f55}table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid #333;padding:4px;text-align:left}th{color:#f55}")
+	fputs(file, "td.n{color:#fc0;font-weight:bold}p{color:#999}</style></head><body><h3>Zombie Classes</h3><table>")
+	fputs(file, "<tr><th>#</th><th>Class</th><th>HP</th><th>Speed</th><th>Gravity</th><th>Attack</th><th>Description</th></tr>")
+
+	static name[64], desc[64], row[512], i
+	for(i = 0; i < g_classcount; i++)
+	{
+		copy(name, charsmax(name), g_class_name[i])
+		copy(desc, charsmax(desc), g_class_desc[i])
+
+		replace_all(name, charsmax(name), "<", "&lt;")
+		replace_all(desc, charsmax(desc), "<", "&lt;")
+
+		formatex(row, charsmax(row), "<tr><td class=^"n^">%d</td><td>%s</td><td>%.0f</td><td>%.0f</td><td>%.2f</td><td>x%.1f</td><td>%s</td></tr>",
+			i + 1, name, g_class_data[i][DATA_HEALTH], g_class_data[i][DATA_SPEED], g_class_data[i][DATA_GRAVITY], g_class_data[i][DATA_ATTACK], desc)
+
+		fputs(file, row)
+	}
+
+	fputs(file, "</table><p>Pick a class with the number keys of the menu, or type <b>bh_class &lt;number&gt;</b> in the console.<br>")
+	fputs(file, "The chosen class is used the next time you become a zombie.</p></body></html>")
+	fclose(file)
+
+	g_class_motd_count = g_classcount
+}
+
+show_class_motd(id)
+{
+	if(g_class_motd_count != g_classcount || !g_class_motd_path[0])
+		build_class_motd()
+
+	if(g_class_motd_path[0] && file_exists(g_class_motd_path))
+		show_motd(id, g_class_motd_path, "Zombie Classes")
 }
 
 public cmd_enablemenu(id)
@@ -1812,6 +1895,9 @@ public task_spawned(taskid)
 
 		client_print(id, print_chat, message)
 
+		if(cvar_class_motd && g_classcount > 1)
+			cmd_classmenu(id)
+
 		if(g_stats_loaded[id])
 			client_print(id, print_chat, "[Biohazard] Level %d, %d XP. Type /rank for your stats, /top for the best players.", g_level[id], g_xp[id])
 	}
@@ -2531,8 +2617,7 @@ public action_class(id, key)
 		case 9: display_classmenu(id, --g_menuposition[id])
 		default:
 		{
-			g_mutate[id] = g_menuposition[id] * 8 + key
-			client_print(id, print_chat, "%L", id, "MENU_CHANGECLASS", g_class_name[g_mutate[id]])
+			set_next_class(id, g_menuposition[id] * 8 + key)
 		}
 	}
 	return PLUGIN_HANDLED
