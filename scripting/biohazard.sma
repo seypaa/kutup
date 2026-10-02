@@ -24,9 +24,9 @@
 *   - Ham_CS_RoundRespawn -> rg_round_respawn
 *   - Persistent stats: XP / level / infections / zombie kills saved per SteamID in nvault,
 *     /rank and /top commands (needs the nvault module enabled)
-*   - HUD status icons (sprites_on_hud.sma must be loaded BEFORE this plugin): infection
-*     countdown, last survivor / no-respawn warnings and the mutation level. Only one
-*     sprite can be shown per player, so a small manager picks by priority and rotates
+*   - HUD status icons through hud_manager.amxx (load order: sprites_on_hud, hud_manager,
+*     biohazard): infection countdown, last survivor / no-respawn warnings and the mutation
+*     level. The welcome banner and the live scoreboard live in hud_manager, not here
 *   - C4 mission: zombies plant a bomb at a random spawn point (rg_plant_bomb),
 *     survivors defuse it with the stock CS defuse; bomb result ends the round
 *   - ScreenFade message filter (flashbang) -> RG_PlayerBlind
@@ -49,6 +49,7 @@
 #include <reapi>
 #include <nvault>
 #include <sprites_on_hud>
+#include <hud_manager>
 #include <xs>
 
 #tryinclude "biohazard.cfg"
@@ -70,19 +71,13 @@
 #define TASKID_ZRESPAWN 912
 #define TASKID_HUDCHECK 950
 #define TASKID_COUNTDOWN 951
-#define TASKID_WELCOME 970
 
 // HUD status sprites, lowest number = highest priority
-#define HUD_WELCOME 0
 #define HUD_COUNTDOWN 1
 #define HUD_LASTSURV 2
 #define HUD_NORESPAWN 3
 #define HUD_MUTATION 4
-#define HUD_SCORE 5
-#define HUD_STATUS_COUNT 6
 #define HUD_OFFSET_Y 80
-#define HUD_WELCOME_OFFSET_Y -90
-#define HUD_SCORE_OFFSET_Y -190
 
 #define EQUIP_PRI (1<<0)
 #define EQUIP_SEC (1<<1)
@@ -262,12 +257,11 @@ new cvar_enabled, cvar_randomspawn, cvar_autonvg, cvar_winsounds, cvar_weaponsme
     Float:cvar_zombiemulti, Float:cvar_zombie_hpmulti, Float:cvar_pushpwr_weapon,
     Float:cvar_pushpwr_zombie, cvar_c4mission, Float:cvar_c4_planttime, Float:cvar_c4_radius,
     cvar_zombie_respawn, Float:cvar_zombie_respawn_time, cvar_mutation_max, cvar_stats,
-    cvar_xp_infect, cvar_xp_kill, cvar_xp_bomb, cvar_maxlevel, cvar_class_motd, cvar_hud, cvar_hud_score, Float:cvar_hud_welcome,
+    cvar_xp_infect, cvar_xp_kill, cvar_xp_bomb, cvar_maxlevel, cvar_class_motd, cvar_hud,
     Float:cvar_mutation_health, Float:cvar_mutation_speed, Float:cvar_mutation_attack
 
 new HudSprite:g_hs_countdown[11], HudSprite:g_hs_mutation[6], HudSprite:g_hs_last,
-    HudSprite:g_hs_norespawn, HudSprite:g_hs_welcome, HudSprite:g_hs_score[10][10], HudSprite:g_hud_status[33][HUD_STATUS_COUNT], HudSprite:g_hud_shown[33],
-    g_hud_rot[33], bool:g_hud_off[33], Float:g_infect_time, g_cd_last,
+    HudSprite:g_hs_norespawn, Float:g_infect_time, g_cd_last,
     g_class_motd_count, g_class_motd_path[96], g_vault, g_xp[33], g_level[33], g_stat_infects[33], g_stat_kills[33], g_stat_key[33][40],
     bool:g_stats_loaded[33], g_mutation[33], bool:g_zrespawn[33], bool:g_zombie[33], bool:g_disconnected[33], bool:g_showmenu[33], bool:g_menufailsafe[33],
     bool:g_preinfect[33], bool:g_welcomemsg[33], bool:g_suicide[33], Float:g_regendelay[33],
@@ -327,8 +321,6 @@ public plugin_precache()
 	bind_int("bh_stats", "1", cvar_stats)
 	bind_int("bh_class_motd", "1", cvar_class_motd)
 	bind_int("bh_hud", "1", cvar_hud)
-	bind_int("bh_hud_score", "1", cvar_hud_score)
-	bind_float("bh_hud_welcome", "6.0", cvar_hud_welcome)
 	bind_int("bh_xp_infect", "5", cvar_xp_infect)
 	bind_int("bh_xp_kill", "10", cvar_xp_kill)
 	bind_int("bh_xp_bomb", "25", cvar_xp_bomb)
@@ -426,7 +418,6 @@ public plugin_init()
 	register_clcmd("say /guns", "cmd_enablemenu")
 	register_clcmd("say /help", "cmd_helpmotd")
 	register_clcmd("say /rank", "cmd_rank")
-	register_clcmd("say /hud", "cmd_hud")
 	register_clcmd("bh_class", "cmd_setclass")
 	register_clcmd("say /top", "cmd_top")
 	register_clcmd("amx_infect", "cmd_infectuser", ADMIN_BAN, "<name or #userid>")
@@ -515,10 +506,6 @@ public plugin_init()
 
 	g_maxplayers = get_maxplayers()
 
-	for(new id = 0; id <= MaxClients; id++)
-		hud_reset_player(id)
-
-	set_task(3.0, "task_hud_rotate", _, _, _, "b")
 
 	g_vault = nvault_open("biohazard_stats")
 	if(g_vault == INVALID_HANDLE)
@@ -592,8 +579,6 @@ cache_weapon_ids()
 
 public client_connect(id)
 {
-	hud_reset_player(id)
-	g_hud_off[id] = false
 	g_showmenu[id] = true
 	g_welcomemsg[id] = true
 	g_zombie[id] = false
@@ -629,7 +614,6 @@ public client_disconnected(id)
 	remove_task(TASKID_WEAPONSMENU + id)
 	remove_task(TASKID_CHECKSPAWN + id)
 	remove_task(TASKID_ZRESPAWN + id)
-	remove_task(TASKID_WELCOME + id)
 
 	g_zrespawn[id] = false
 	g_disconnected[id] = true
@@ -889,7 +873,6 @@ public rg_round_restart_post()
 	{
 		hud_clear(id, HUD_LASTSURV)
 		hud_clear(id, HUD_NORESPAWN)
-		hud_clear(id, HUD_SCORE)
 		remove_task(TASKID_ZRESPAWN + id)
 		g_zrespawn[id] = false
 		g_mutation[id] = 0
@@ -1664,37 +1647,6 @@ new const g_icon_font[10][7] =
 	{ 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C }
 }
 
-// 5x7 letters for the welcome banner (+ row 0 for the dot of the Turkish I, row 8 for the cedilla)
-// ids: 0 A, 1 C, 2 D, 3 E, 4 G, 5 H, 6 I, 7 L, 8 M, 9 N, 10 O, 11 S, 12 U, 13 Z, 14 S-cedilla, 15 dotted I, 16 B
-new const g_letters[17][9] =
-{
-	{ 0x00, 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11, 0x00 },
-	{ 0x00, 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E, 0x00 },
-	{ 0x00, 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E, 0x00 },
-	{ 0x00, 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F, 0x00 },
-	{ 0x00, 0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F, 0x00 },
-	{ 0x00, 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11, 0x00 },
-	{ 0x00, 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E, 0x00 },
-	{ 0x00, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F, 0x00 },
-	{ 0x00, 0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11, 0x00 },
-	{ 0x00, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11, 0x00 },
-	{ 0x00, 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00 },
-	{ 0x00, 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E, 0x00 },
-	{ 0x00, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00 },
-	{ 0x00, 0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F, 0x00 },
-	{ 0x00, 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E, 0x04 },
-	{ 0x04, 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E, 0x00 },
-	{ 0x00, 0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E, 0x00 }
-}
-
-// SUNUCUMUZA / HOSGELDINIZ
-new const g_welcome_line1[] = { 11, 12, 9, 12, 1, 12, 8, 12, 13, 0 }
-new const g_welcome_line2[] = { 5, 10, 14, 4, 3, 7, 2, 15, 9, 15, 13 }
-
-// ZOMBI / INSAN (with the dotted Turkish I)
-new const g_label_zombi[] = { 13, 10, 8, 16, 15 }
-new const g_label_insan[] = { 15, 9, 11, 0, 9 }
-
 new g_icon[ICON_BUFFER], g_icon_w, g_icon_h
 
 cv_clear(width, height)
@@ -1811,52 +1763,6 @@ cv_number(number, scale, color)
 	}
 }
 
-// One digit of the 5x7 font at the given position
-cv_digit(digit, x, y, scale, color)
-{
-	for(new row = 0; row < 7; row++)
-	{
-		for(new col = 0; col < 5; col++)
-		{
-			if(g_icon_font[digit][row] & (1 << (4 - col)))
-				cv_rect(x + col * scale, y + row * scale, x + col * scale + scale - 1, y + row * scale + scale - 1, color)
-		}
-	}
-}
-
-// Scoreboard value 0-8 exact, 9 means "9 or more" and gets a plus sign
-cv_score_value(value, x, color)
-{
-	new y = (g_icon_h - 21) / 2
-
-	cv_digit(min(value, 9), x, y, 3, color)
-
-	if(value >= 9)
-	{
-		cv_rect(x + 24, y + 3, x + 26, y + 17, color)
-		cv_rect(x + 18, y + 9, x + 32, y + 11, color)
-	}
-}
-
-// One line of letters (glyph ids) at the given top-left, scale pixels per font pixel
-cv_letters(const ids[], count, x, y, scale, color)
-{
-	new i, row, col
-
-	for(i = 0; i < count; i++)
-	{
-		for(row = 0; row < 9; row++)
-		{
-			for(col = 0; col < 5; col++)
-			{
-				if(g_letters[ids[i]][row] & (1 << (4 - col)))
-					cv_rect(x + col * scale, y + row * scale, x + col * scale + scale - 1, y + row * scale + scale - 1, color)
-			}
-		}
-		x += 6 * scale
-	}
-}
-
 // Writes the canvas as a single frame, 8-bit paletted, alpha test sprite
 hud_write_sprite(const name[])
 {
@@ -1965,29 +1871,6 @@ hud_generate_sprites()
 		cv_rect(18 + i * 4, 34, 19 + i * 4, 40, PAL_NONE)
 
 	hud_write_sprite("bh_norespawn")
-
-	// Welcome banner, two lines of 2x scaled letters (130 and 118 pixels wide)
-	cv_clear(144, 40)
-	cv_letters(g_welcome_line1, sizeof g_welcome_line1, 12, 1, 2, PAL_YELLOW)
-	cv_letters(g_welcome_line2, sizeof g_welcome_line2, 6, 21, 2, PAL_WHITE)
-	hud_write_sprite("bh_welcome")
-
-	// Scoreboard: every zombie / survivor combination from 0 to 9+ (100 sprites)
-	for(i = 0; i < 10; i++)
-	{
-		for(j = 0; j < 10; j++)
-		{
-			cv_clear(216, 24)
-			cv_letters(g_label_zombi, sizeof g_label_zombi, 2, 3, 2, PAL_RED)
-			cv_score_value(i, 66, PAL_WHITE)
-			cv_rect(106, 2, 107, 21, PAL_ORANGE)
-			cv_letters(g_label_insan, sizeof g_label_insan, 113, 3, 2, PAL_GREEN)
-			cv_score_value(j, 177, PAL_WHITE)
-
-			formatex(name, charsmax(name), "bh_sb_%d_%d", i, j)
-			hud_write_sprite(name)
-		}
-	}
 }
 
 // Must run in plugin_precache; missing sprite files just give InvalidHudSprite
@@ -2011,129 +1894,20 @@ hud_precache()
 
 	g_hs_last = HS_PrecacheSprite("bh_last", 0, HUD_OFFSET_Y)
 	g_hs_norespawn = HS_PrecacheSprite("bh_norespawn", 0, HUD_OFFSET_Y)
-	g_hs_welcome = HS_PrecacheSprite("bh_welcome", 0, HUD_WELCOME_OFFSET_Y)
-
-	for(i = 0; i < 10; i++)
-	{
-		for(new j = 0; j < 10; j++)
-		{
-			formatex(name, charsmax(name), "bh_sb_%d_%d", i, j)
-			g_hs_score[i][j] = HS_PrecacheSprite(name, 0, HUD_SCORE_OFFSET_Y)
-		}
-	}
 }
 
-hud_reset_player(id)
-{
-	for(new status = 0; status < HUD_STATUS_COUNT; status++)
-		g_hud_status[id][status] = InvalidHudSprite
-
-	g_hud_shown[id] = InvalidHudSprite
-	g_hud_rot[id] = 0
-}
-
-stock hud_set(id, status, HudSprite:sprite)
-{
-	if(!is_valid_player(id) || g_hud_status[id][status] == sprite)
-		return
-
-	g_hud_status[id][status] = sprite
-	hud_refresh(id)
-}
-
-stock hud_clear(id, status)
-	hud_set(id, status, InvalidHudSprite)
-
-// Shows the sprite of the active status; with several active ones the rotation index picks
-hud_refresh(id)
-{
-	if(!is_user_connected(id))
-		return
-
-	static HudSprite:list[HUD_STATUS_COUNT], HudSprite:target, count, status
-	count = 0
-
-	if(cvar_hud && !g_hud_off[id])
-	{
-		for(status = 0; status < HUD_STATUS_COUNT; status++)
-		{
-			if(g_hud_status[id][status] != InvalidHudSprite)
-				list[count++] = g_hud_status[id][status]
-		}
-	}
-
-	if(!count)
-	{
-		if(g_hud_shown[id] != InvalidHudSprite)
-		{
-			HS_ClearSprite(id)
-			g_hud_shown[id] = InvalidHudSprite
-		}
-		return
-	}
-
-	// The welcome banner is shown alone, the other icons rotate
-	target = (g_hud_status[id][HUD_WELCOME] != InvalidHudSprite) ? g_hud_status[id][HUD_WELCOME] : list[g_hud_rot[id] % count]
-
-	if(target != g_hud_shown[id])
-	{
-		HS_DrawSprite(id, target)
-		g_hud_shown[id] = target
-	}
-}
-
-// Every few seconds players with more than one active status see the next one
-public task_hud_rotate()
+// Sprites are handed to the HUD Manager (hud_manager.amxx), which also owns the welcome
+// banner and the live scoreboard. Slots: 1 countdown, 2 last survivor, 3 no respawn, 4 mutation
+stock hud_set(id, slot, HudSprite:sprite)
 {
 	if(!cvar_hud)
-		return
+		sprite = InvalidHudSprite
 
-	static id, status, active
-
-	for(id = 1; id <= g_maxplayers; id++)
-	{
-		if(!is_user_connected(id))
-			continue
-
-		active = 0
-
-		for(status = 0; status < HUD_STATUS_COUNT; status++)
-		{
-			if(g_hud_status[id][status] != InvalidHudSprite)
-				active++
-		}
-
-		if(active > 1 && g_hud_status[id][HUD_WELCOME] == InvalidHudSprite)
-		{
-			g_hud_rot[id]++
-			hud_refresh(id)
-		}
-	}
+	HM_SetStatus(id, slot, sprite)
 }
 
-// Welcome banner shown for a few seconds when a player first spawns
-hud_welcome(id)
-{
-	if(cvar_hud_welcome <= 0.0 || !cvar_hud)
-		return
-
-	hud_set(id, HUD_WELCOME, g_hs_welcome)
-
-	remove_task(TASKID_WELCOME + id)
-	set_task(cvar_hud_welcome, "task_welcome_end", TASKID_WELCOME + id)
-}
-
-public task_welcome_end(taskid)
-	hud_clear(taskid - TASKID_WELCOME, HUD_WELCOME)
-
-public cmd_hud(id)
-{
-	g_hud_off[id] = !g_hud_off[id]
-	hud_refresh(id)
-
-	client_print(id, print_chat, "[Biohazard] HUD icons %s.", g_hud_off[id] ? "disabled" : "enabled")
-	return PLUGIN_HANDLED
-}
+stock hud_clear(id, slot)
+	HM_ClearStatus(id, slot)
 
 // Last 10 seconds before the first zombie appears
 countdown_start()
@@ -2204,30 +1978,10 @@ public task_hud_check()
 		}
 	}
 
-	// Live scoreboard: alive zombies against alive survivors
-	static zombies, humans, HudSprite:score
-	zombies = 0
-	humans = 0
-
-	for(id = 1; id <= g_maxplayers; id++)
-	{
-		if(!is_user_alive(id))
-			continue
-
-		if(g_zombie[id])
-			zombies++
-		else
-			humans++
-	}
-
-	score = (cvar_hud_score && g_gamestarted && !g_roundended) ? g_hs_score[min(zombies, 9)][min(humans, 9)] : InvalidHudSprite
-
 	for(id = 1; id <= g_maxplayers; id++)
 	{
 		if(!is_user_connected(id))
 			continue
-
-		hud_set(id, HUD_SCORE, score)
 
 		if(id == last)
 			hud_set(id, HUD_LASTSURV, g_hs_last)
@@ -2555,8 +2309,6 @@ public task_spawned(taskid)
 		replace(message, charsmax(message), "#Version#", VERSION)
 
 		client_print(id, print_chat, message)
-
-		hud_welcome(id)
 
 		if(cvar_class_motd && g_classcount > 1)
 			cmd_classmenu(id)
