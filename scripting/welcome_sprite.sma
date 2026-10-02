@@ -15,6 +15,13 @@
 *  full size, floats up and down gently while it is shown and drifts upwards while it fades away.
 *  (mode 0 can only do the grow, its position is fixed to the model attachment.)
 *
+*  Attached to a weapon (ws_mode 0): the banner follows an attachment point of the weapon model the
+*  player is holding. In first person the engine uses the VIEW model (v_*.mdl) for it, so the
+*  point has to exist in that model, e.g. the attachment added to v_ak47.mdl with
+*  tools/mdl_attachment.py. The sprite is only visible while that weapon is in hand (ws_weapon).
+*  ws_attach counts from 1: QC / tool attachment 0 is ws_attach 1, attachment 2 is ws_attach 3.
+*    ws_mode 0, ws_attach 3, ws_weapon ak47     (the patched v_ak47.mdl)
+*
 *  Cvars (server.cfg):
 *    ws_time    7.0    seconds the banner stays, 0 disables it
 *    ws_mode    1      1 = floats in front of the eyes (position is fully predictable)
@@ -22,7 +29,8 @@
 *    ws_scale   0.14   sprite scale (world units per sprite pixel)
 *    ws_dist    32.0   mode 1: distance in front of the eyes
 *    ws_height  10.0   mode 1: how far above the crosshair
-*    ws_attach  4      mode 0: attachment point of the player model
+*    ws_attach  4      mode 0: attachment of the weapon model, counted from 1
+*    ws_weapon  ""     mode 0: only show while this weapon is in hand (ak47, m4a1 ...), empty = always
 *    ws_motion  1      slide / grow / float motion, 0 = banner stays still
 *    ws_slide   40.0   mode 1: how far to the left the slide starts (world units)
 *  Player command: say /welcome shows the banner again.
@@ -36,6 +44,10 @@
 
 #if !defined EF_OWNER_VISIBILITY
 	#define EF_OWNER_VISIBILITY 4096
+#endif
+
+#if !defined EF_NODRAW
+	#define EF_NODRAW 128
 #endif
 
 #if !defined SF_SPRITE_ONCE
@@ -97,8 +109,9 @@ new const g_line2[] = { 5, 10, 14, 4, 3, 7, 2, 15, 9, 15, 13 }
 new g_canvas[BANNER_W * BANNER_H]
 
 new g_ent[33], Float:g_start[33], bool:g_pending[33]
-new g_active, g_fwd_think, g_isz_sprite
-new bool:g_ready
+new g_active, g_fwd_think, g_isz_sprite, g_filter_weapon
+new bool:g_hidden[33]
+new bool:g_ready, g_weapon_name[24]
 
 new cvar_mode, cvar_attach, cvar_motion, Float:cvar_slide, Float:cvar_time, Float:cvar_scale, Float:cvar_dist, Float:cvar_height
 
@@ -110,6 +123,7 @@ public plugin_precache()
 	bind_pcvar_float(register_cvar("ws_dist", "32.0"), cvar_dist)
 	bind_pcvar_float(register_cvar("ws_height", "10.0"), cvar_height)
 	bind_pcvar_num(register_cvar("ws_attach", "4"), cvar_attach)
+	bind_pcvar_string(register_cvar("ws_weapon", ""), g_weapon_name, charsmax(g_weapon_name))
 	bind_pcvar_num(register_cvar("ws_motion", "1"), cvar_motion)
 	bind_pcvar_float(register_cvar("ws_slide", "40.0"), cvar_slide)
 
@@ -189,6 +203,18 @@ banner_create(id)
 
 	banner_remove(id)
 
+	// Weapon the banner is tied to (mode 0), 0 means every weapon
+	g_filter_weapon = 0
+
+	if(!cvar_mode && g_weapon_name[0])
+	{
+		static weapon[32]
+		formatex(weapon, charsmax(weapon), "weapon_%s", g_weapon_name)
+		g_filter_weapon = get_weaponid(weapon)
+	}
+
+	g_hidden[id] = false
+
 	new ent = engfunc(EngFunc_CreateNamedEntity, g_isz_sprite)
 	if(pev_valid(ent) != 2)
 		return
@@ -255,6 +281,20 @@ banner_remove(id)
 			g_fwd_think = 0
 		}
 	}
+}
+
+// Hides the banner while the player holds a weapon that has no matching attachment point
+banner_weapon_visibility(id, ent)
+{
+	new bool:hide = (get_user_weapon(id) != g_filter_weapon)
+
+	if(hide == g_hidden[id])
+		return
+
+	g_hidden[id] = hide
+
+	new effects = pev(ent, pev_effects)
+	set_pev(ent, pev_effects, hide ? (effects | EF_NODRAW) : (effects & ~EF_NODRAW))
 }
 
 // Mode 1: keeps the sprite in front of the eyes of its owner, with the slide / float motion
@@ -342,6 +382,10 @@ public task_anim()
 			amount = 255.0 * elapsed / FADE_IN_TIME
 		else if(elapsed > duration - FADE_OUT_TIME)
 			amount = 255.0 * (duration - elapsed) / FADE_OUT_TIME
+
+		// Weapon attachment: the point only exists on the right model, hide it for other weapons
+		if(g_filter_weapon)
+			banner_weapon_visibility(id, ent)
 
 		set_pev(ent, pev_frame, float(frame))
 		set_pev(ent, pev_renderamt, amount)
