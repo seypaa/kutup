@@ -239,9 +239,10 @@ new cvar_enabled, cvar_randomspawn, cvar_autonvg, cvar_winsounds, cvar_weaponsme
     cvar_shootobjects, cvar_ammo, Float:cvar_starttime, Float:cvar_knockback_dist,
     Float:cvar_zombiemulti, Float:cvar_zombie_hpmulti, Float:cvar_pushpwr_weapon,
     Float:cvar_pushpwr_zombie, cvar_c4mission, Float:cvar_c4_planttime, Float:cvar_c4_radius,
-    cvar_zombie_respawn, Float:cvar_zombie_respawn_time
+    cvar_zombie_respawn, Float:cvar_zombie_respawn_time, cvar_mutation_max,
+    Float:cvar_mutation_health, Float:cvar_mutation_speed, Float:cvar_mutation_attack
 
-new bool:g_zrespawn[33], bool:g_zombie[33], bool:g_disconnected[33], bool:g_showmenu[33], bool:g_menufailsafe[33],
+new g_mutation[33], bool:g_zrespawn[33], bool:g_zombie[33], bool:g_disconnected[33], bool:g_showmenu[33], bool:g_menufailsafe[33],
     bool:g_preinfect[33], bool:g_welcomemsg[33], bool:g_suicide[33], Float:g_regendelay[33],
     g_mutate[33], g_victim[33], g_menuposition[33], g_player_class[33], g_player_weapons[33][2]
 
@@ -296,6 +297,10 @@ public plugin_precache()
 	bind_float("bh_pushpwr_zombie", "5.0", cvar_pushpwr_zombie)
 	bind_int("bh_c4mission", "1", cvar_c4mission)
 	bind_int("bh_zombie_respawn", "1", cvar_zombie_respawn)
+	bind_int("bh_mutation_max", "3", cvar_mutation_max)
+	bind_float("bh_mutation_health", "50.0", cvar_mutation_health)
+	bind_float("bh_mutation_speed", "15.0", cvar_mutation_speed)
+	bind_float("bh_mutation_attack", "0.1", cvar_mutation_attack)
 	bind_float("bh_zombie_respawn_time", "3.0", cvar_zombie_respawn_time)
 	bind_float("bh_c4_planttime", "3.0", cvar_c4_planttime)
 	bind_float("bh_c4_radius", "120.0", cvar_c4_radius)
@@ -543,6 +548,7 @@ public client_connect(id)
 	g_player_weapons[id][1] = -1
 	g_regendelay[id] = 0.0
 	g_zrespawn[id] = false
+	g_mutation[id] = 0
 }
 
 public client_putinserver(id)
@@ -735,6 +741,7 @@ public rg_round_restart_post()
 	{
 		remove_task(TASKID_ZRESPAWN + id)
 		g_zrespawn[id] = false
+		g_mutation[id] = 0
 	}
 
 	if(cvar_buytime)
@@ -928,7 +935,7 @@ public task_regen()
 		pclass = g_player_class[id]
 		pev(id, pev_health, health)
 
-		if(health >= g_class_data[pclass][DATA_HEALTH])
+		if(health >= zombie_max_health(id))
 			continue
 
 		set_pev(id, pev_health, health + 1.0)
@@ -1024,7 +1031,7 @@ public rg_player_givedefaultitems(const id)
 public rg_player_resetmaxspeed(const id)
 {
 	if(g_zombie[id] && is_user_alive(id))
-		set_pev(id, pev_maxspeed, g_class_data[g_player_class[id]][DATA_SPEED])
+		set_pev(id, pev_maxspeed, g_class_data[g_player_class[id]][DATA_SPEED] + g_mutation[id] * cvar_mutation_speed)
 
 	return HC_CONTINUE
 }
@@ -1118,7 +1125,7 @@ public rg_player_takedamage(const victim, inflictor, attacker, Float:damage, dam
 			return HC_SUPERCEDE
 		}
 
-		damage *= g_class_data[g_player_class[attacker]][DATA_ATTACK]
+		damage *= g_class_data[g_player_class[attacker]][DATA_ATTACK] * (1.0 + g_mutation[attacker] * cvar_mutation_attack)
 
 		static Float:armor
 		pev(victim, pev_armorvalue, armor)
@@ -1185,6 +1192,7 @@ public rg_player_takedamage_post(const victim, inflictor, attacker, Float:damage
 	message_end()
 
 	infect_user(victim, attacker)
+	mutate_zombie(attacker)
 
 	static Float:frags
 	pev(attacker, pev_frags, frags)
@@ -1232,6 +1240,13 @@ public rg_player_killed(const victim, killer, shouldgib)
 // Zombie respawn: queued when a zombie dies, cancelled once one survivor is left
 public rg_player_killed_post(const victim, killer, shouldgib)
 {
+	// A zombie that kills a survivor mutates, a zombie that dies loses its mutations
+	if(!g_zombie[victim] && is_valid_player(killer) && g_zombie[killer])
+		mutate_zombie(killer)
+
+	if(g_zombie[victim] && g_mutation[victim])
+		mutation_reset(victim)
+
 	if(!cvar_zombie_respawn || !g_zombie[victim] || !g_gamestarted || g_roundended)
 		return HC_CONTINUE
 
@@ -1283,6 +1298,60 @@ stock count_survivors()
 			count++
 	}
 	return count
+}
+
+/* ------------------------------------------------------------------ */
+/* Mutation: zombies get stronger with every survivor they take down   */
+/* ------------------------------------------------------------------ */
+
+stock Float:zombie_max_health(id)
+	return g_class_data[g_player_class[id]][DATA_HEALTH] + g_mutation[id] * cvar_mutation_health
+
+mutate_zombie(id)
+{
+	if(!is_valid_player(id) || !g_zombie[id] || !is_user_alive(id) || g_mutation[id] >= cvar_mutation_max)
+		return
+
+	static Float:health
+	g_mutation[id]++
+
+	// Instant heal for the bonus health, then the new speed
+	pev(id, pev_health, health)
+	set_pev(id, pev_health, floatmin(health + cvar_mutation_health, zombie_max_health(id)))
+	rg_reset_maxspeed(id)
+	mutation_glow(id)
+
+	set_hudmessage(80, 255, 80, -1.0, 0.3, 0, 0.0, 3.0, 0.1, 0.5)
+	ShowSyncHudMsg(id, g_sync_msgdisplay, "MUTATION %d/%d^nStronger, faster, deadlier!", g_mutation[id], cvar_mutation_max)
+}
+
+mutation_reset(id)
+{
+	g_mutation[id] = 0
+	mutation_glow(id)
+}
+
+// Glow shell gets stronger and redder with each level
+mutation_glow(id)
+{
+	static Float:color[3], Float:fraction
+
+	if(g_mutation[id] <= 0)
+	{
+		set_pev(id, pev_renderfx, kRenderFxNone)
+		set_pev(id, pev_renderamt, 0.0)
+		return
+	}
+
+	fraction = float(g_mutation[id]) / float(max(cvar_mutation_max, 1))
+
+	color[0] = 60.0 + 195.0 * fraction
+	color[1] = 255.0 - 215.0 * fraction
+	color[2] = 40.0
+
+	set_pev(id, pev_renderfx, kRenderFxGlowShell)
+	set_pev(id, pev_rendercolor, color)
+	set_pev(id, pev_renderamt, 10.0 + 20.0 * fraction)
 }
 
 reward_clip(id)
@@ -1600,9 +1669,9 @@ public task_showtruehealth()
 		class = g_player_class[id]
 
 		if(g_classcount > 1)
-			ShowSyncHudMsg(id, g_sync_hpdisplay, "Health: %0.f  Class: %s (%s)", health, g_class_name[class], g_class_desc[class])
+			ShowSyncHudMsg(id, g_sync_hpdisplay, "Health: %0.f  Class: %s (%s)  Mutation: %d/%d", health, g_class_name[class], g_class_desc[class], g_mutation[id], cvar_mutation_max)
 		else
-			ShowSyncHudMsg(id, g_sync_hpdisplay, "Health: %0.f", health)
+			ShowSyncHudMsg(id, g_sync_hpdisplay, "Health: %0.f  Mutation: %d/%d", health, g_mutation[id], cvar_mutation_max)
 	}
 }
 
@@ -1984,6 +2053,7 @@ cure_user(id)
 	was_zombie = g_zombie[id]
 
 	g_zombie[id] = false
+	mutation_reset(id)
 
 	rg_reset_user_model(id, true)
 	set_member(id, m_bHasNightVision, false)
@@ -2024,7 +2094,7 @@ set_zombie_attibutes(const index)
 	}
 
 	new iClass = g_player_class[index]
-	new Float:flHealth = g_class_data[iClass][DATA_HEALTH]
+	new Float:flHealth = g_class_data[iClass][DATA_HEALTH] + g_mutation[index] * cvar_mutation_health
 
 	if(g_preinfect[index])
 		flHealth *= cvar_zombie_hpmulti
