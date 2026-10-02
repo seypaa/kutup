@@ -2,6 +2,7 @@
 """Generates the HUD sprites used by biohazard.sma (needs sprites_on_hud.sma).
 
 Output: ../sprites/*.spr  (copy the folder to cstrike/sprites on the server and FastDL).
+Check a copied folder:  python3 gen_hud_sprites.py --check <path to cstrike/sprites>
 Pure Python, no dependencies. Sprites are 48x48 8-bit paletted, index 255 is transparent.
 """
 import math
@@ -159,6 +160,22 @@ def make_no_respawn():
     return c
 
 
+def check(folder):
+    """Validates .spr files in a folder (use it on the server copy): magic, version, exact size."""
+    bad = 0
+    for name in sorted(os.listdir(folder)):
+        if not name.startswith("bh_") or not name.endswith(".spr"):
+            continue
+        with open(os.path.join(folder, name), "rb") as f:
+            data = f.read()
+        head = data[:4]
+        version = struct.unpack("<i", data[4:8])[0] if len(data) >= 8 else -1
+        ok = head == b"IDSP" and version == 2 and len(data) == 3134
+        bad += 0 if ok else 1
+        print("%-18s %5d bytes  head=%r  %s" % (name, len(data), head, "OK" if ok else "CORRUPT"))
+    print("All files OK" if not bad else "%d corrupt file(s): copy them again in BINARY mode" % bad)
+
+
 def main():
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sprites")
     os.makedirs(out, exist_ok=True)
@@ -173,4 +190,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 2 and sys.argv[1] == "--check":
+        check(sys.argv[2])
+    else:
+        main()
