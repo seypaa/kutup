@@ -78,7 +78,7 @@
 #define _random(%1) random_num(0, %1 - 1)
 #define AMMOWP_NULL (1<<0 | 1<<CSW_KNIFE | 1<<CSW_FLASHBANG | 1<<CSW_HEGRENADE | 1<<CSW_SMOKEGRENADE | 1<<CSW_C4)
 #define is_valid_player(%1) (1 <= %1 <= MaxClients)
-#define is_playing_team(%1) (%1 == TEAM_TERRORIST || %1 == TEAM_CT)
+#define is_playing_team(%1) (%1 == _:TEAM_TERRORIST || %1 == _:TEAM_CT)
 
 enum
 {
@@ -513,7 +513,7 @@ public client_putinserver(id)
 		g_player_class[id] = _random(g_classcount)
 }
 
-public client_disconnect(id)
+public client_disconnected(id)
 {
 	remove_task(TASKID_UPDATESCR + id)
 	remove_task(TASKID_SPAWNDELAY + id)
@@ -614,7 +614,7 @@ public msg_teaminfo(msgid, dest, id)
 	id = randomly_pick_zombie()
 	if(id)
 	{
-		rg_set_user_team(id, g_zombie[id] ? TEAM_CT : TEAM_TERRORIST, MODEL_UNASSIGNED, false)
+		rg_set_user_team(id, g_zombie[id] ? _:TEAM_CT : _:TEAM_TERRORIST, MODEL_UNASSIGNED, false)
 		set_pev(id, pev_deadflag, DEAD_RESPAWNABLE)
 	}
 	return PLUGIN_CONTINUE
@@ -1415,8 +1415,8 @@ public task_spawned(taskid)
 
 	if(!g_gamestarted)
 		client_print(id, print_chat, "%L %L", id, "SCAN_RESULTS", id, g_preinfect[id] ? "SCAN_INFECTED" : "SCAN_CLEAN")
-	else if(get_member(id, m_iTeam) == TEAM_TERRORIST)
-		rg_set_user_team(id, TEAM_CT, MODEL_UNASSIGNED)
+	else if(get_member(id, m_iTeam) == _:TEAM_TERRORIST)
+		rg_set_user_team(id, _:TEAM_CT, MODEL_UNASSIGNED)
 }
 
 public task_checkspawn(taskid)
@@ -1551,7 +1551,7 @@ public task_initround()
 		if(id == newzombie || g_preinfect[id])
 			infect_user(id, 0)
 		else
-			rg_set_user_team(id, TEAM_CT, MODEL_UNASSIGNED)
+			rg_set_user_team(id, _:TEAM_CT, MODEL_UNASSIGNED)
 	}
 
 	set_hudmessage(_, _, _, _, _, 1)
@@ -1581,8 +1581,8 @@ public task_startround()
 public task_balanceteam()
 {
 	static players[4][32], count[4], all[32], num
-	count[TEAM_TERRORIST] = 0
-	count[TEAM_CT] = 0
+	count[_:TEAM_TERRORIST] = 0
+	count[_:TEAM_CT] = 0
 
 	get_players(all, num)
 
@@ -1596,21 +1596,21 @@ public task_balanceteam()
 			players[team][count[team]++] = id
 	}
 
-	if(abs(count[TEAM_TERRORIST] - count[TEAM_CT]) <= 1)
+	if(abs(count[_:TEAM_TERRORIST] - count[_:TEAM_CT]) <= 1)
 		return
 
 	static maxplayers
-	maxplayers = (count[TEAM_TERRORIST] + count[TEAM_CT]) / 2
+	maxplayers = (count[_:TEAM_TERRORIST] + count[_:TEAM_CT]) / 2
 
-	if(count[TEAM_TERRORIST] > maxplayers)
+	if(count[_:TEAM_TERRORIST] > maxplayers)
 	{
-		for(i = 0; i < (count[TEAM_TERRORIST] - maxplayers); i++)
-			rg_set_user_team(players[TEAM_TERRORIST][i], TEAM_CT, MODEL_UNASSIGNED, false)
+		for(i = 0; i < (count[_:TEAM_TERRORIST] - maxplayers); i++)
+			rg_set_user_team(players[_:TEAM_TERRORIST][i], _:TEAM_CT, MODEL_UNASSIGNED, false)
 	}
 	else
 	{
-		for(i = 0; i < (count[TEAM_CT] - maxplayers); i++)
-			rg_set_user_team(players[TEAM_CT][i], TEAM_TERRORIST, MODEL_UNASSIGNED, false)
+		for(i = 0; i < (count[_:TEAM_CT] - maxplayers); i++)
+			rg_set_user_team(players[_:TEAM_CT][i], _:TEAM_TERRORIST, MODEL_UNASSIGNED, false)
 	}
 }
 
@@ -1650,7 +1650,7 @@ infect_user(victim, attacker)
 		ShowSyncHudMsg(victim, g_sync_msgdisplay, "%L", victim, "MUTATION_HUD", g_class_name[g_player_class[victim]])
 	}
 
-	rg_set_user_team(victim, TEAM_TERRORIST, MODEL_UNASSIGNED)
+	rg_set_user_team(victim, _:TEAM_TERRORIST, MODEL_UNASSIGNED)
 	set_zombie_attibutes(victim)
 
 	emit_sound(victim, CHAN_STATIC, g_scream_sounds[_random(sizeof g_scream_sounds)], VOL_NORM, ATTN_NONE, 0, PITCH_NORM)
