@@ -16,6 +16,7 @@
 *    hm_welcome  6.0   seconds the welcome banner stays, 0 disables it
 *    hm_score    1     live scoreboard
 *    hm_labels   0     0 = T / CT, 1 = ZOMBI / INSAN
+*    hm_score_time 4.0 seconds the board stays after a change, 0 = always visible (heavier)
 *  Player command: /hud toggles the icons for that player.
 */
 
@@ -34,6 +35,7 @@
 #define OFFSET_SCORE_Y -190
 
 #define TASKID_WELCOME 100
+#define TASKID_SLOT 1000 // + id * SLOT_COUNT + slot
 
 // Sprite canvas
 #define ICON_BUFFER (216 * 48)
@@ -102,7 +104,7 @@ new HudSprite:g_status[33][SLOT_COUNT], HudSprite:g_shown[33], g_rotation[33]
 new bool:g_hidden[33], bool:g_welcome_pending[33]
 new g_last_score = -1
 
-new Float:cvar_welcome, cvar_score, cvar_labels
+new Float:cvar_welcome, cvar_score, cvar_labels, Float:cvar_score_time
 
 /* ------------------------------------------------------------------ */
 /* Precache: build and register the sprites                            */
@@ -113,6 +115,7 @@ public plugin_precache()
 	bind_pcvar_float(register_cvar("hm_welcome", "6.0"), cvar_welcome)
 	bind_pcvar_num(register_cvar("hm_score", "1"), cvar_score)
 	bind_pcvar_num(register_cvar("hm_labels", "0"), cvar_labels)
+	bind_pcvar_float(register_cvar("hm_score_time", "4.0"), cvar_score_time)
 
 	generate_sprites()
 
@@ -185,7 +188,7 @@ public bool:native_set_status(plugin, params)
 	if(id < 1 || id > MaxClients || slot < HM_SLOT_FIRST || slot > HM_SLOT_LAST)
 		return false
 
-	set_status(id, slot, HudSprite:get_param(3))
+	set_status(id, slot, HudSprite:get_param(3), Float:get_param_f(4))
 	return true
 }
 
@@ -204,13 +207,26 @@ public bool:native_clear_status(plugin, params)
 /* Manager                                                             */
 /* ------------------------------------------------------------------ */
 
-set_status(id, slot, HudSprite:sprite)
+set_status(id, slot, HudSprite:sprite, Float:duration = 0.0)
 {
 	if(g_status[id][slot] == sprite)
 		return
 
+	// A new sprite replaces the old one and its timer
+	remove_task(TASKID_SLOT + id * SLOT_COUNT + slot)
+
 	g_status[id][slot] = sprite
+
+	if(sprite != InvalidHudSprite && duration > 0.0)
+		set_task(duration, "task_slot_expire", TASKID_SLOT + id * SLOT_COUNT + slot)
+
 	refresh(id)
+}
+
+public task_slot_expire(taskid)
+{
+	taskid -= TASKID_SLOT
+	set_status(taskid / SLOT_COUNT, taskid % SLOT_COUNT, InvalidHudSprite)
 }
 
 // Welcome banner alone, otherwise the active sprites in turns
@@ -309,7 +325,8 @@ public task_welcome_end(taskid)
 /* Live scoreboard                                                     */
 /* ------------------------------------------------------------------ */
 
-// Alive T against alive CT, 0-8 exact and 9 means "9 or more"
+// Alive T against alive CT, 0-8 exact and 9 means "9 or more".
+// The board pops up for hm_score_time seconds whenever the numbers change; with 0 it stays on screen
 public task_score()
 {
 	static id, team, t, ct, index, HudSprite:sprite
@@ -345,11 +362,14 @@ public task_score()
 	index = min(t, 9) * 10 + min(ct, 9)
 	sprite = g_sprite_score[min(t, 9)][min(ct, 9)]
 
-	// Everybody gets it again when the score changed, newcomers pick it up on the next change
-	for(id = 1; id <= MaxClients; id++)
+	// Newcomers pick it up on the next change
+	if(index != g_last_score || cvar_score_time <= 0.0)
 	{
-		if(is_user_connected(id) && (index != g_last_score || g_status[id][SLOT_SCORE] == InvalidHudSprite))
-			set_status(id, SLOT_SCORE, sprite)
+		for(id = 1; id <= MaxClients; id++)
+		{
+			if(is_user_connected(id))
+				set_status(id, SLOT_SCORE, sprite, cvar_score_time)
+		}
 	}
 
 	g_last_score = index

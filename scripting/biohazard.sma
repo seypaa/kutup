@@ -1898,12 +1898,12 @@ hud_precache()
 
 // Sprites are handed to the HUD Manager (hud_manager.amxx), which also owns the welcome
 // banner and the live scoreboard. Slots: 1 countdown, 2 last survivor, 3 no respawn, 4 mutation
-stock hud_set(id, slot, HudSprite:sprite)
+stock hud_set(id, slot, HudSprite:sprite, Float:duration = 0.0)
 {
 	if(!cvar_hud)
 		sprite = InvalidHudSprite
 
-	HM_SetStatus(id, slot, sprite)
+	HM_SetStatus(id, slot, sprite, duration)
 }
 
 stock hud_clear(id, slot)
@@ -1984,12 +1984,12 @@ public task_hud_check()
 			continue
 
 		if(id == last)
-			hud_set(id, HUD_LASTSURV, g_hs_last)
+			hud_set(id, HUD_LASTSURV, g_hs_last, 6.0)
 		else
 			hud_clear(id, HUD_LASTSURV)
 
 		if(last && g_zombie[id] && cvar_zombie_respawn)
-			hud_set(id, HUD_NORESPAWN, g_hs_norespawn)
+			hud_set(id, HUD_NORESPAWN, g_hs_norespawn, 6.0)
 		else
 			hud_clear(id, HUD_NORESPAWN)
 	}
@@ -2015,7 +2015,7 @@ mutate_zombie(id)
 	set_pev(id, pev_health, floatmin(health + cvar_mutation_health, zombie_max_health(id)))
 	rg_reset_maxspeed(id)
 	mutation_glow(id)
-	hud_set(id, HUD_MUTATION, g_hs_mutation[min(g_mutation[id], 5)])
+	hud_set(id, HUD_MUTATION, g_hs_mutation[min(g_mutation[id], 5)], 4.0)
 
 	set_hudmessage(80, 255, 80, -1.0, 0.3, 0, 0.0, 3.0, 0.1, 0.5)
 	ShowSyncHudMsg(id, g_sync_msgdisplay, "MUTATION %d/%d^nStronger, faster, deadlier!", g_mutation[id], cvar_mutation_max)

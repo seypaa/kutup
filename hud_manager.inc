@@ -31,10 +31,14 @@
  * @param id        Player index
  * @param slot      HM_SLOT_FIRST .. HM_SLOT_LAST
  * @param sprite    Handle from HS_PrecacheSprite()
+ * @param duration  Seconds until the slot clears itself, 0.0 keeps it until you clear it.
+ *                  Prefer short durations: while a sprite is on screen sprites_on_hud has to
+ *                  resend the weapon HUD messages on every weapon update (every shot), so a
+ *                  sprite that is always visible costs network traffic and client prediction.
  *
  * @return          true on success
  */
-native bool:HM_SetStatus(id, slot, HudSprite:sprite)
+native bool:HM_SetStatus(id, slot, HudSprite:sprite, Float:duration = 0.0)
 
 /**
  * Clears the status sprite of a slot for a player.
