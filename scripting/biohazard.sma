@@ -614,7 +614,7 @@ public msg_teaminfo(msgid, dest, id)
 	id = randomly_pick_zombie()
 	if(id)
 	{
-		rg_set_user_team(id, g_zombie[id] ? _:TEAM_CT : _:TEAM_TERRORIST, MODEL_UNASSIGNED, false)
+		rg_set_user_team(id, _:(g_zombie[id] ? TEAM_CT : TEAM_TERRORIST), MODEL_UNASSIGNED, false)
 		set_pev(id, pev_deadflag, DEAD_RESPAWNABLE)
 	}
 	return PLUGIN_CONTINUE
