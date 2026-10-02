@@ -1626,10 +1626,263 @@ public cmd_top(id)
 /* HUD status icons (sprites_on_hud)                                   */
 /* ------------------------------------------------------------------ */
 
+/* Sprite generator: the .spr files are written by the plugin itself at every map start,
+ * so nothing binary has to be copied to the server (and FTP text mode cannot corrupt it). */
+
+#define ICON_SIZE 48
+#define ICON_PIXELS (ICON_SIZE * ICON_SIZE)
+
+// Palette indexes, 255 is the transparent one
+#define PAL_WHITE 1
+#define PAL_RED 2
+#define PAL_YELLOW 3
+#define PAL_GREEN 4
+#define PAL_ORANGE 5
+#define PAL_NONE 255
+
+// 5x7 digit font, one row per entry, bit 4 is the leftmost pixel
+new const g_icon_font[10][7] =
+{
+	{ 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E },
+	{ 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E },
+	{ 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F },
+	{ 0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E },
+	{ 0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02 },
+	{ 0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E },
+	{ 0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E },
+	{ 0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 },
+	{ 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E },
+	{ 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C }
+}
+
+new g_icon[ICON_PIXELS]
+
+cv_clear()
+	arrayset(g_icon, PAL_NONE, ICON_PIXELS)
+
+cv_set(x, y, color)
+{
+	if(x >= 0 && x < ICON_SIZE && y >= 0 && y < ICON_SIZE)
+		g_icon[y * ICON_SIZE + x] = color
+}
+
+cv_rect(x0, y0, x1, y1, color)
+{
+	for(new y = y0; y <= y1; y++)
+	{
+		for(new x = x0; x <= x1; x++)
+			cv_set(x, y, color)
+	}
+}
+
+cv_circle(cx, cy, r, color)
+{
+	for(new y = cy - r; y <= cy + r; y++)
+	{
+		for(new x = cx - r; x <= cx + r; x++)
+		{
+			if((x - cx) * (x - cx) + (y - cy) * (y - cy) <= r * r)
+				cv_set(x, y, color)
+		}
+	}
+}
+
+bool:cv_inside(const Float:pts[][2], count, Float:x, Float:y)
+{
+	new bool:inside = false, j = count - 1
+
+	for(new i = 0; i < count; i++)
+	{
+		if((pts[i][1] > y) != (pts[j][1] > y)
+		&& x < (pts[j][0] - pts[i][0]) * (y - pts[i][1]) / (pts[j][1] - pts[i][1]) + pts[i][0])
+			inside = !inside
+
+		j = i
+	}
+	return inside
+}
+
+cv_polygon(const Float:pts[][2], count, color)
+{
+	for(new y = 0; y < ICON_SIZE; y++)
+	{
+		for(new x = 0; x < ICON_SIZE; x++)
+		{
+			if(cv_inside(pts, count, float(x) + 0.5, float(y) + 0.5))
+				cv_set(x, y, color)
+		}
+	}
+}
+
+cv_triangle(x0, y0, x1, y1, x2, y2, color)
+{
+	new Float:pts[3][2]
+
+	pts[0][0] = float(x0), pts[0][1] = float(y0)
+	pts[1][0] = float(x1), pts[1][1] = float(y1)
+	pts[2][0] = float(x2), pts[2][1] = float(y2)
+
+	cv_polygon(pts, 3, color)
+}
+
+cv_star(cx, cy, r, color)
+{
+	new Float:pts[10][2], Float:angle, Float:radius
+
+	for(new i = 0; i < 10; i++)
+	{
+		angle = -1.5707963 + float(i) * 0.6283185
+		radius = (i % 2 == 0) ? float(r) : float(r) * 0.45
+
+		pts[i][0] = float(cx) + radius * floatcos(angle, radian)
+		pts[i][1] = float(cy) + radius * floatsin(angle, radian)
+	}
+	cv_polygon(pts, 10, color)
+}
+
+// Centered number 1-10
+cv_number(number, scale, color)
+{
+	new digits[2], count, i, row, col, x, y
+
+	if(number >= 10)
+		digits[count++] = number / 10
+
+	digits[count++] = number % 10
+
+	x = (ICON_SIZE - (count * 5 * scale + (count - 1) * scale)) / 2
+	y = (ICON_SIZE - 7 * scale) / 2
+
+	for(i = 0; i < count; i++)
+	{
+		for(row = 0; row < 7; row++)
+		{
+			for(col = 0; col < 5; col++)
+			{
+				if(g_icon_font[digits[i]][row] & (1 << (4 - col)))
+					cv_rect(x + col * scale, y + row * scale, x + col * scale + scale - 1, y + row * scale + scale - 1, color)
+			}
+		}
+		x += 6 * scale
+	}
+}
+
+// Writes the canvas as a single frame, 8-bit paletted, alpha test sprite
+hud_write_sprite(const name[])
+{
+	static path[64], palette[768], header[4], bool:ready
+
+	formatex(path, charsmax(path), "sprites/%s.spr", name)
+
+	new file = fopen(path, "wb")
+	if(!file)
+	{
+		log_amx("Could not write %s, HUD icon will be missing", path)
+		return
+	}
+
+	if(!ready)
+	{
+		ready = true
+
+		palette[PAL_WHITE * 3] = 255, palette[PAL_WHITE * 3 + 1] = 255, palette[PAL_WHITE * 3 + 2] = 255
+		palette[PAL_RED * 3] = 255, palette[PAL_RED * 3 + 1] = 50, palette[PAL_RED * 3 + 2] = 40
+		palette[PAL_YELLOW * 3] = 255, palette[PAL_YELLOW * 3 + 1] = 215, palette[PAL_YELLOW * 3 + 2] = 0
+		palette[PAL_GREEN * 3] = 80, palette[PAL_GREEN * 3 + 1] = 255, palette[PAL_GREEN * 3 + 2] = 90
+		palette[PAL_ORANGE * 3] = 255, palette[PAL_ORANGE * 3 + 1] = 150, palette[PAL_ORANGE * 3 + 2] = 30
+	}
+
+	header[0] = 'I', header[1] = 'D', header[2] = 'S', header[3] = 'P'
+	fwrite_blocks(file, header, 4, BLOCK_BYTE)
+
+	fwrite(file, 2, BLOCK_INT)                  // version
+	fwrite(file, 2, BLOCK_INT)                  // type: vp_parallel
+	fwrite(file, 3, BLOCK_INT)                  // texture format: alpha test
+	fwrite(file, _:33.936, BLOCK_INT)           // bounding radius
+	fwrite(file, ICON_SIZE, BLOCK_INT)          // width
+	fwrite(file, ICON_SIZE, BLOCK_INT)          // height
+	fwrite(file, 1, BLOCK_INT)                  // frames
+	fwrite(file, 0, BLOCK_INT)                  // beam length
+	fwrite(file, 0, BLOCK_INT)                  // sync type
+	fwrite(file, 256, BLOCK_SHORT)              // palette colors
+	fwrite_blocks(file, palette, 768, BLOCK_BYTE)
+
+	fwrite(file, 0, BLOCK_INT)                  // frame group
+	fwrite(file, -ICON_SIZE / 2, BLOCK_INT)     // origin x
+	fwrite(file, ICON_SIZE / 2, BLOCK_INT)      // origin y
+	fwrite(file, ICON_SIZE, BLOCK_INT)
+	fwrite(file, ICON_SIZE, BLOCK_INT)
+	fwrite_blocks(file, g_icon, ICON_PIXELS, BLOCK_BYTE)
+
+	fclose(file)
+}
+
+hud_generate_sprites()
+{
+	static name[32], i, j, x, color, r
+
+	for(i = 1; i <= 10; i++)
+	{
+		cv_clear()
+		cv_number(i, (i < 10) ? 4 : 3, (i > 3) ? PAL_YELLOW : PAL_RED)
+
+		formatex(name, charsmax(name), "bh_cd_%d", i)
+		hud_write_sprite(name)
+	}
+
+	for(i = 1; i <= 5; i++)
+	{
+		cv_clear()
+
+		switch(i)
+		{
+			case 1, 2: color = PAL_GREEN
+			case 3: color = PAL_YELLOW
+			case 4: color = PAL_ORANGE
+			default: color = PAL_RED
+		}
+
+		r = (i <= 3) ? 9 : 7
+		x = (ICON_SIZE - (i * (2 * r + 2) - 2)) / 2 + r
+
+		for(j = 0; j < i; j++)
+		{
+			cv_star(x, ICON_SIZE / 2, r, color)
+			x += 2 * r + 2
+		}
+
+		formatex(name, charsmax(name), "bh_mut_%d", i)
+		hud_write_sprite(name)
+	}
+
+	// Last survivor: warning triangle with an exclamation mark
+	cv_clear()
+	cv_triangle(24, 4, 45, 42, 3, 42, PAL_YELLOW)
+	cv_triangle(24, 12, 38, 37, 10, 37, PAL_NONE)
+	cv_rect(22, 18, 25, 30, PAL_YELLOW)
+	cv_rect(22, 33, 25, 36, PAL_YELLOW)
+	hud_write_sprite("bh_last")
+
+	// No more respawns: skull
+	cv_clear()
+	cv_circle(24, 20, 14, PAL_WHITE)
+	cv_rect(15, 28, 33, 40, PAL_WHITE)
+	cv_circle(18, 20, 4, PAL_NONE)
+	cv_circle(30, 20, 4, PAL_NONE)
+	cv_triangle(24, 24, 21, 30, 27, 30, PAL_NONE)
+
+	for(i = 0; i < 4; i++)
+		cv_rect(18 + i * 4, 34, 19 + i * 4, 40, PAL_NONE)
+
+	hud_write_sprite("bh_norespawn")
+}
+
 // Must run in plugin_precache; missing sprite files just give InvalidHudSprite
 hud_precache()
 {
 	static name[32], i
+
+	hud_generate_sprites()
 
 	for(i = 1; i <= 10; i++)
 	{
