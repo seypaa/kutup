@@ -22,6 +22,8 @@
 *   - Flashlight block (FM_CmdStart) -> RG_CBasePlayer_ImpulseCommands
 *   - Random spawns task -> RG_CSGameRules_GetPlayerSpawnSpot
 *   - Ham_CS_RoundRespawn -> rg_round_respawn
+*   - C4 mission: zombies plant a bomb at a random spawn point (rg_plant_bomb),
+*     survivors defuse it with the stock CS defuse; bomb result ends the round
 *   - ScreenFade message filter (flashbang) -> RG_PlayerBlind
 *   - DeathMsg message filter -> RG_CSGameRules_SendDeathMessage
 *   - "jointeam" client command -> RG_HandleMenu_ChooseTeam
@@ -217,7 +219,8 @@ new const g_dataname[][] =
 new g_maxplayers, g_spawncount, g_buyzone, g_sync_hpdisplay, g_sync_msgdisplay, g_fwd_spawn,
     g_fwd_result, g_fwd_infect, g_fwd_gamestart, g_msg_flashlight, g_msg_scoreattrib,
     g_msg_deathmsg, g_msg_screenfade, g_msg_scoreinfo, Float:g_buytime, bool:g_zombies_exist,
-    HookChain:g_hc_impulse, HookChain:g_hc_postthink,
+    HookChain:g_hc_impulse, HookChain:g_hc_postthink, bool:g_c4_active, Float:g_c4_site[3],
+    Float:g_c4_progress[33], g_spr_ring, g_sync_c4,
     Float:g_spawns[MAX_SPAWNS+1][9], bool:g_infecting, bool:g_gamestarted, bool:g_roundstarted,
     bool:g_roundended, bool:g_allow_item, bool:g_setting_model, g_class_name[MAX_CLASSES+1][32],
     g_classcount, g_class_desc[MAX_CLASSES+1][32], g_class_pmodel[MAX_CLASSES+1][64],
@@ -234,7 +237,7 @@ new cvar_enabled, cvar_randomspawn, cvar_autonvg, cvar_winsounds, cvar_weaponsme
     cvar_knockback_duck, cvar_killreward, cvar_painshockfree, cvar_zombie_class,
     cvar_shootobjects, cvar_ammo, Float:cvar_starttime, Float:cvar_knockback_dist,
     Float:cvar_zombiemulti, Float:cvar_zombie_hpmulti, Float:cvar_pushpwr_weapon,
-    Float:cvar_pushpwr_zombie
+    Float:cvar_pushpwr_zombie, cvar_c4mission, Float:cvar_c4_planttime, Float:cvar_c4_radius
 
 new bool:g_zombie[33], bool:g_disconnected[33], bool:g_showmenu[33], bool:g_menufailsafe[33],
     bool:g_preinfect[33], bool:g_welcomemsg[33], bool:g_suicide[33], Float:g_regendelay[33],
@@ -289,6 +292,9 @@ public plugin_precache()
 	bind_int("bh_shootobjects", "1", cvar_shootobjects)
 	bind_float("bh_pushpwr_weapon", "2.0", cvar_pushpwr_weapon)
 	bind_float("bh_pushpwr_zombie", "5.0", cvar_pushpwr_zombie)
+	bind_int("bh_c4mission", "1", cvar_c4mission)
+	bind_float("bh_c4_planttime", "3.0", cvar_c4_planttime)
+	bind_float("bh_c4_radius", "120.0", cvar_c4_radius)
 
 	new file[64]
 	get_configsdir(file, charsmax(file))
@@ -331,6 +337,8 @@ public plugin_precache()
 
 	for(i = 0; i < sizeof g_survivor_win_sounds; i++)
 		precache_sound(g_survivor_win_sounds[i])
+
+	g_spr_ring = precache_model("sprites/white.spr")
 
 	g_fwd_spawn = register_forward(FM_Spawn, "fwd_spawn")
 
@@ -388,6 +396,7 @@ public plugin_init()
 	RegisterHookChain(RG_CBasePlayer_TakeDamage, "rg_player_takedamage_post", true)
 	RegisterHookChain(RG_CBasePlayer_TraceAttack, "rg_player_traceattack")
 	RegisterHookChain(RG_CBasePlayer_Killed, "rg_player_killed")
+	RegisterHookChain(RG_CGrenade_DefuseBombEnd, "rg_defuse_end_post", true)
 	RegisterHookChain(RG_HandleMenu_ChooseTeam, "rg_choose_team")
 	RegisterHookChain(RG_PlayerBlind, "rg_player_blind")
 	RegisterHookChain(RG_CSGameRules_FlPlayerFallDamage, "rg_fall_damage")
@@ -450,6 +459,7 @@ public plugin_init()
 
 	g_sync_hpdisplay = CreateHudSyncObj()
 	g_sync_msgdisplay = CreateHudSyncObj()
+	g_sync_c4 = CreateHudSyncObj()
 
 	g_maxplayers = get_maxplayers()
 
@@ -468,6 +478,7 @@ public plugin_init()
 	}
 
 	set_task(0.05, "task_regen", _, _, _, "b")
+	set_task(0.1, "task_c4mission", _, _, _, "b")
 
 	if(cvar_showtruehealth)
 		set_task(0.2, "task_showtruehealth", _, _, _, "b")
@@ -686,12 +697,12 @@ public msg_textmsg(msgid, dest, id)
 	if(equal(txtmsg[1], "Game_bomb_drop"))
 		return PLUGIN_HANDLED
 
-	if(equal(txtmsg[1], "Terrorists_Win"))
+	if(equal(txtmsg[1], "Terrorists_Win") || equal(txtmsg[1], "Target_Bombed"))
 	{
 		formatex(winmsg, charsmax(winmsg), "%L", LANG_SERVER, "WIN_TXT_ZOMBIES")
 		set_msg_arg_string(2, winmsg)
 	}
-	else if(equal(txtmsg[1], "Target_Saved") || equal(txtmsg[1], "CTs_Win"))
+	else if(equal(txtmsg[1], "Target_Saved") || equal(txtmsg[1], "CTs_Win") || equal(txtmsg[1], "Bomb_Defused"))
 	{
 		formatex(winmsg, charsmax(winmsg), "%L", LANG_SERVER, "WIN_TXT_SURVIVORS")
 		set_msg_arg_string(2, winmsg)
@@ -710,6 +721,7 @@ public rg_round_restart_post()
 
 	g_zombies_exist = false
 	DisableHookChain(g_hc_impulse)
+	c4_reset()
 
 	if(cvar_buytime)
 	{
@@ -1642,6 +1654,171 @@ public task_startround()
 {
 	g_gamestarted = true
 	ExecuteForward(g_fwd_gamestart, g_fwd_result)
+
+	c4_start()
+}
+
+/* ------------------------------------------------------------------ */
+/* C4 mission                                                          */
+/* ------------------------------------------------------------------ */
+
+c4_reset()
+{
+	g_c4_active = false
+
+	for(new id = 1; id <= g_maxplayers; id++)
+	{
+		if(g_c4_progress[id] > 0.0)
+			rg_send_bartime(id, 0)
+
+		g_c4_progress[id] = 0.0
+	}
+}
+
+// Picks a random spawn point as the bomb site; zombies must plant the C4 there
+c4_start()
+{
+	if(!cvar_c4mission || g_spawncount <= 0 || rg_is_bomb_planted())
+		return
+
+	copy_spawn_vec(g_c4_site, _random(g_spawncount), 0)
+	g_c4_active = true
+
+	// The bomb target scenario must be known to the game rules for the bomb to end the round
+	set_member_game(m_bTargetBombed, false)
+	set_member_game(m_bMapHasBombTarget, true)
+
+	set_hudmessage(255, 60, 60, -1.0, 0.25, 1, 0.0, 6.0, 0.2, 0.2)
+	ShowSyncHudMsg(0, g_sync_c4, "C4 MISSION^nZombies: plant the bomb at the marked ring (hold E)^nSurvivors: stop them and defuse it!")
+	client_print(0, print_chat, "[Biohazard] C4 mission started! Zombies must plant the bomb at the red ring.")
+}
+
+public task_c4mission()
+{
+	if(!g_c4_active)
+		return
+
+	if(!g_gamestarted || rg_is_bomb_planted())
+	{
+		// Planted by us (or a round ended): stop tracking
+		c4_reset()
+		return
+	}
+
+	static id, bool:inzone, Float:origin[3], Float:radius, Float:planttime, Float:now
+	static ticks
+	radius = cvar_c4_radius
+	planttime = cvar_c4_planttime
+
+	for(id = 1; id <= g_maxplayers; id++)
+	{
+		inzone = false
+
+		if(g_zombie[id] && is_user_alive(id))
+		{
+			pev(id, pev_origin, origin)
+			inzone = (get_distance_f(origin, g_c4_site) <= radius)
+		}
+
+		if(!inzone || !(pev(id, pev_button) & IN_USE))
+		{
+			if(g_c4_progress[id] > 0.0)
+			{
+				g_c4_progress[id] = 0.0
+				rg_send_bartime(id, 0)
+			}
+			continue
+		}
+
+		if(g_c4_progress[id] <= 0.0)
+			rg_send_bartime(id, max(1, floatround(planttime)))
+
+		g_c4_progress[id] += 0.1
+
+		if(g_c4_progress[id] >= planttime)
+		{
+			c4_plant(id)
+			return
+		}
+	}
+
+	// Once a second: draw the site ring and hint zombies standing in it
+	if(++ticks < 10)
+		return
+
+	ticks = 0
+	now = float(floatround(radius))
+
+	message_begin(MSG_BROADCAST, SVC_TEMPENTITY)
+	write_byte(TE_BEAMCYLINDER)
+	engfunc(EngFunc_WriteCoord, g_c4_site[0])
+	engfunc(EngFunc_WriteCoord, g_c4_site[1])
+	engfunc(EngFunc_WriteCoord, g_c4_site[2])
+	engfunc(EngFunc_WriteCoord, g_c4_site[0])
+	engfunc(EngFunc_WriteCoord, g_c4_site[1])
+	engfunc(EngFunc_WriteCoord, g_c4_site[2] + now)
+	write_short(g_spr_ring)
+	write_byte(0)
+	write_byte(0)
+	write_byte(10)
+	write_byte(8)
+	write_byte(0)
+	write_byte(255)
+	write_byte(40)
+	write_byte(40)
+	write_byte(200)
+	write_byte(0)
+	message_end()
+
+	for(id = 1; id <= g_maxplayers; id++)
+	{
+		if(g_zombie[id] && g_c4_progress[id] <= 0.0 && is_user_alive(id))
+		{
+			pev(id, pev_origin, origin)
+
+			if(get_distance_f(origin, g_c4_site) <= radius)
+				client_print(id, print_center, "Hold E to plant the C4")
+		}
+	}
+}
+
+c4_plant(planter)
+{
+	static Float:origin[3], Float:angles[3], flags, ent
+
+	pev(planter, pev_origin, origin)
+	pev(planter, pev_angles, angles)
+	flags = pev(planter, pev_flags)
+
+	// Put the bomb on the floor under the planter
+	origin[2] -= (flags & FL_DUCKING) ? 18.0 : 36.0
+	angles[0] = 0.0
+	angles[2] = 0.0
+
+	ent = rg_plant_bomb(planter, origin, angles)
+	c4_reset()
+
+	if(ent <= 0)
+		return
+
+	static name[32]
+	get_user_name(planter, name, charsmax(name))
+
+	set_hudmessage(255, 60, 60, -1.0, 0.25, 1, 0.0, 6.0, 0.2, 0.2)
+	ShowSyncHudMsg(0, g_sync_c4, "%s planted the C4!^nSurvivors: defuse it before it explodes!", name)
+	client_print(0, print_chat, "[Biohazard] %s planted the C4! Survivors must defuse it.", name)
+}
+
+public rg_defuse_end_post(const bomb, const player, bool:bDefused)
+{
+	if(!bDefused || !is_valid_player(player))
+		return HC_CONTINUE
+
+	static name[32]
+	get_user_name(player, name, charsmax(name))
+
+	client_print(0, print_chat, "[Biohazard] %s defused the C4! Survivors win.", name)
+	return HC_CONTINUE
 }
 
 public task_balanceteam()
